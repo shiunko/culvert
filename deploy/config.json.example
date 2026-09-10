@@ -1,0 +1,13 @@
+{
+  "_comment": "复制到 /etc/culvert/config.json，将权限限制为 0600；如初始化需要凭据，请仅在本地添加。切勿提交凭据。",
+  "port": 10092,
+  "publicIp": "127.0.0.1",
+  "containerCli": "podman",
+  "caddyDomains": [],
+  "allowedImages": [],
+  "dockerMutationsEnabled": false,
+  "smolvmMutationsEnabled": false,
+  "s3": {
+    "enabled": false
+  }
+}

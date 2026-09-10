@@ -1,0 +1,109 @@
+{:paths ["src" "test"]
+ :deps {hiccup/hiccup {:mvn/version "2.0.0"}}
+ :tasks
+ {dev {:doc "Start app with nREPL on port 16666 for REPL-driven development"
+       :task (do
+               (require 'culvert.main)
+               (try
+                 (let [start-fn (requiring-resolve 'babashka.nrepl/start-server!)]
+                   (when start-fn
+                     (start-fn {:port 16666 :host "127.0.0.1"})
+                     (spit ".nrepl-port" "16666")
+                     (println "[nrepl] nREPL server started on port :16666")))
+                 (catch Exception _
+                   (println "[nrepl] nREPL unavailable, starting without debug mode")))
+               ((requiring-resolve 'culvert.main/-main)))}
+
+  run {:doc "Start app in production mode (no nREPL, no Java required)"
+       :override-builtin true
+       :task (do
+               (require 'culvert.main)
+               ((requiring-resolve 'culvert.main/-main)))}
+
+  test {:doc "Run all unit tests"
+        :task (shell "bb" "-m" "culvert.runner")}
+
+  test-ns {:doc "Run tests for a single namespace, e.g. bb test-ns culvert.web-test"
+           :task (let [ns (first *command-line-args*)]
+                   (if ns
+                     (do (require (symbol ns))
+                         (let [results ((requiring-resolve 'clojure.test/run-tests) (symbol ns))
+                               fail (+ (:fail results 0) (:error results 0))]
+                           (System/exit fail)))
+                     (do (println "Usage: bb test-ns <namespace>")
+                         (System/exit 1))))}
+
+  lint {:doc "Run clj-kondo static analysis on src and test"
+        :task (let [result (shell "clj-kondo" "--lint" "src" "test")]
+                (println (:out result))
+                (System/exit (:exit result)))}
+
+  fmt {:doc "Format Clojure source with the pinned cljfmt"
+       :task (shell "mise" "exec" "--" "cljfmt" "fix" "src" "test" "build.clj")}
+
+  fmt-check {:doc "Check Clojure formatting without modifying files"
+             :task (shell "mise" "exec" "--" "cljfmt" "check" "src" "test" "build.clj")}
+
+  clean {:doc "Remove temp files from tests (test-*.json, *.tmp)"
+         :task (do
+                 (let [dir (clojure.java.io/file ".")
+                       dir-files (.listFiles dir)
+                       temp-files (filter (fn [f]
+                                            (and (.isFile f)
+                                                 (let [n (.getName f)]
+                                                   (or (.startsWith n "test-")
+                                                       (.endsWith n ".tmp")))))
+                                          dir-files)]
+                   (doseq [f temp-files]
+                     (.delete f)
+                     (println "removed:" (.getName f)))
+                   (println (format "Cleaned %d temp files." (count temp-files)))))}
+
+  check {:doc "Verify all namespaces load without errors"
+         :task (do
+                 (println "Checking namespace loading...")
+                 (let [namespaces ['culvert.config
+                                   'culvert.db
+                                   'culvert.auth
+                                   'culvert.cli
+                                   'culvert.forward
+                                   'culvert.caddy
+                                   'culvert.s3
+                                   'culvert.docker
+                                   'culvert.web
+                                   'culvert.main]
+                       errors (atom [])]
+                   (doseq [ns namespaces]
+                     (let [ok (try (require ns) true
+                                   (catch Exception e
+                                     (swap! errors conj {:ns ns :error (.getMessage e)})
+                                     false))]
+                       (println (format "  %-40s %s" (str ns) (if ok "OK" "FAIL")))))
+                   (if (empty? (deref errors))
+                     (println "All namespaces loaded successfully.")
+                     (do (println (format "\n%d namespace(s) failed to load." (count (deref errors))))
+                         (System/exit 1)))))}
+
+  nrepl {:doc "Start standalone nREPL server on port 16666 (no app)"
+         :task (try
+                 (let [start-fn (requiring-resolve 'babashka.nrepl/start-server!)]
+                   (start-fn {:port 16666 :host "127.0.0.1"})
+                   (spit ".nrepl-port" "16666")
+                   (println "[nrepl] Standalone nREPL server started on port :16666")
+                   (while true (Thread/sleep 60000)))
+                 (catch Exception e
+                   (println "[nrepl] Not available:" (.getMessage e))
+                   (println "[nrepl] This Babashka build does not include nREPL support.")
+                   (System/exit 1)))}
+
+  version {:doc "Show project and runtime version info"
+           :override-builtin true
+           :task (do
+                   (println "culvert  v4.0.0")
+                   (let [bb-ver (clojure.string/trim
+                                 (:out (shell {:out :string} "bb" "--version")))]
+                     (println "Babashka        " bb-ver))
+                   (println "Java            " (System/getProperty "java.version"))
+                   (println "OS              " (str (System/getProperty "os.name") " "
+                                                  (System/getProperty "os.version")))
+                   (println "CPUs            " (.availableProcessors (Runtime/getRuntime))))}}}

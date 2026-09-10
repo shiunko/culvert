@@ -1,0 +1,49 @@
+[tools]
+babashka = "1.13.220"
+caddy = "2.11.4"
+clj-kondo = "2026.08.04"
+# cljfmt 不在 mise 的 tool registry 中，只有显式指定 github 后端才能在全新环境
+# （CI、新机器）安装；用 registry 名 cljfmt 会依赖本地已安装的 asdf 插件，
+# CI 上会报 "cljfmt not found in mise tool registry"。
+"github:weavejester/cljfmt" = "0.16.5"
+clojure = "1.12.6.1673"
+"github:tailwindlabs/tailwindcss" = "4"
+java = "temurin-26.0.2+10"
+
+[tasks.code]
+run = "claude --dangerously-skip-permissions"
+
+[tasks.run]
+description = "Run the application on JVM Clojure"
+run = "clojure -M -m culvert.main"
+
+[tasks.test]
+description = "Run formatting, tests, namespace checks, and linting"
+run = """
+bb fmt-check
+bb test
+clojure -M:test
+bb check
+clj-kondo --lint src test build.clj
+mise run css-check
+"""
+
+[tasks.css]
+description = "用 Tailwind CLI 把 styles/app.css 编译为 public/app.css（生成产物，勿手改后者）"
+run = "tailwindcss -i styles/app.css -o public/app.css"
+
+[tasks."css-check"]
+description = "编译 CSS 并确认 public/app.css 与仓库内容一致，防止手改生成产物导致漂移"
+run = """
+tailwindcss -i styles/app.css -o public/app.css
+git diff --exit-code public/app.css || (echo 'public/app.css 与 styles/app.css 编译结果不一致，请勿手改 public/app.css，改 styles/app.css 后运行 mise run css' && exit 1)
+"""
+
+[tasks.build]
+description = "Build the JVM uberjar"
+run = "clojure -T:build uber"
+
+[tasks.package]
+description = "在 Linux x86_64 上创建内置 Temurin runtime 的生产归档"
+depends = ["build"]
+run = "deploy/bin/build-jpackage"

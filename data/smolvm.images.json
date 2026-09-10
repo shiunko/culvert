@@ -1,0 +1,64 @@
+{
+  "images": [
+    {
+      "name": "alpine:3.21",
+      "entry": "/bin/sh",
+      "description": "Alpine Linux 3.21"
+    },
+    {
+      "name": "alpine:latest",
+      "entry": "/bin/sh",
+      "description": "Alpine Linux (latest)"
+    },
+    {
+      "name": "ubuntu:22.04",
+      "entry": "/bin/bash",
+      "description": "Ubuntu 22.04 LTS"
+    },
+    {
+      "name": "ubuntu:24.04",
+      "entry": "/bin/bash",
+      "description": "Ubuntu 24.04 LTS"
+    },
+    {
+      "name": "debian:12",
+      "entry": "/bin/bash",
+      "description": "Debian 12 Bookworm"
+    },
+    {
+      "name": "python:3.12-alpine",
+      "entry": "/bin/sh",
+      "description": "Python 3.12 (Alpine)"
+    },
+    {
+      "name": "python:3.12",
+      "entry": "/bin/bash",
+      "description": "Python 3.12"
+    },
+    {
+      "name": "node:22-alpine",
+      "entry": "/bin/sh",
+      "description": "Node.js 22 (Alpine)"
+    },
+    {
+      "name": "node:22",
+      "entry": "/bin/bash",
+      "description": "Node.js 22"
+    },
+    {
+      "name": "golang:1.23-alpine",
+      "entry": "/bin/sh",
+      "description": "Go 1.23 (Alpine)"
+    },
+    {
+      "name": "golang:1.23",
+      "entry": "/bin/bash",
+      "description": "Go 1.23"
+    },
+    {
+      "name": "rust:1.85",
+      "entry": "/bin/bash",
+      "description": "Rust 1.85"
+    }
+  ]
+}

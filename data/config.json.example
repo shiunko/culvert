@@ -1,0 +1,88 @@
+{
+  "_comment": "复制到 CULVERT_CONFIG_DIR/config.json（默认 data/config.json）；运行状态写入 CULVERT_DATA_DIR（默认 data）",
+
+  "port": 10392,
+  "publicIp": "127.0.0.1",
+
+  "_auth_comment": "仅首次启动使用：请设置唯一管理员用户名和高强度随机密码；留空则不自动创建，CHANGE_ME 和 admin123 会被拒绝",
+  "authUser": "",
+  "authPass": "",
+
+  "containerCli": "podman",
+  "caddyDomains": ["example.com"],
+
+  "defaultShell": "/bin/bash",
+  "defaultCpuLimit": "2",
+  "defaultMemLimit": "512m",
+  "maxCpuLimit": "8",
+  "maxMemLimit": "4g",
+
+  "_allowedImages_comment": "镜像白名单 (空数组则允许 images.json 中定义的全部镜像)",
+  "allowedImages": [
+    "ubuntu:22.04",
+    "ubuntu:24.04",
+    "debian:12",
+    "node:22",
+    "node:24",
+    "python:3.12",
+    "python:3.13",
+    "golang:1.23",
+    "rust:1.85",
+    "alpine:3.21"
+  ],
+
+  "_paths_comment": "以下路径留空则自动从 PATH 查找",
+  "socatPath": "",
+  "iptablesPath": "",
+  "caddyPath": "",
+  "ttydPath": "",
+  "containerCliPath": "",
+
+  "ttydMaxClients": 1,
+  "_ttydMaxClients_comment": "ttyd 每个终端最大客户端连接数，<=0 表示不限制",
+  "ttydPortRange": {
+    "start": 17680,
+    "end": 17999
+  },
+
+  "portForwardRange": {
+    "start": 18000,
+    "end": 29999
+  },
+
+  "defaultQuota": {
+    "portForwards": 5,
+    "reverseProxies": 5,
+    "containers": 2,
+    "smolvmMachines": 2,
+    "cpuLimit": 2,
+    "memLimit": "2g"
+  },
+
+  "_smolvm_comment": "smolvm 配置（全部可选，未安装 smolvm 不影响正常运行）",
+  "smolvmPath": "",
+  "smolvmDefaultShell": "/bin/sh",
+  "smolvmDefaultCpu": "4",
+  "smolvmDefaultMem": "1024",
+  "_smolvmPortRange_comment": "smolvm ttyd (30000-30099) + 端口映射 (30100-31999)",
+  "smolvmPortRange": {
+    "start": 30000,
+    "end": 31999
+  },
+
+  "_s3_comment": "S3 数据挂载: 用户创建容器时可传入 s3Endpoint/s3Bucket/s3AccessKey/s3SecretKey 将 S3 存储挂载到容器 /mnt/data",
+  "s3": {
+    "enabled": true,
+    "fsType": "goofys",
+    "fsPath": "",
+    "hostMountRoot": "/mnt/s3",
+    "containerMountPath": "/mnt/data",
+    "mountTimeoutSec": 15,
+    "defaultOptions": {
+      "dirMode": "0755",
+      "fileMode": "0644",
+      "uid": "1000",
+      "gid": "1000"
+    }
+  }
+}

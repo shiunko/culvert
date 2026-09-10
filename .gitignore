@@ -1,0 +1,19 @@
+.clj-kondo/
+.lsp/
+.cpcache/
+.clojure/
+.deps.clj/
+.m2/
+.nrepl-port
+bb
+target/
+.omo
+
+# Runtime configuration, credentials, and mutable state
+data/*
+!data/config.json.example
+!data/images.json
+!data/smolvm.images.json
+
+# Temporary database files
+*.tmp

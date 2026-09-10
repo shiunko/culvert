@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+APP_NAME=culvert
+APP_VERSION=4.0.0
+EXPECTED_JAVA_VERSION=26.0.2
+EXPECTED_RUNTIME_VERSION=26.0.2+10
+EXPECTED_RUNTIME_MARKER=Temurin-26.0.2+10
+JAR_NAME=${APP_NAME}-${APP_VERSION}-standalone.jar
+JAR_PATH=target/${JAR_NAME}
+INPUT_DIR=target/jpackage-input
+PACKAGE_DIR=target/package
+
+fail() {
+  printf 'jpackage 构建失败：%s\n' "$1" >&2
+  exit 1
+}
+
+[ "$(uname -s)" = Linux ] || fail "生产 app-image 必须在 Linux 上构建"
+case "$(uname -m)" in
+  x86_64 | amd64) ;;
+  *) fail "仅支持 Linux x86_64，当前架构为 $(uname -m)" ;;
+esac
+
+[ -n "${JAVA_HOME:-}" ] || fail "必须设置 JAVA_HOME"
+JAVA_BIN=${JAVA_HOME}/bin/java
+JPACKAGE_BIN=${JAVA_HOME}/bin/jpackage
+[ -x "$JAVA_BIN" ] || fail "JAVA_HOME 中没有可执行的 java"
+[ -x "$JPACKAGE_BIN" ] || fail "JAVA_HOME 中没有可执行的 jpackage"
+[ -r "$JAR_PATH" ] || fail "缺少 ${JAR_PATH}，请先构建 uberjar"
+command -v git >/dev/null 2>&1 || fail "缺少 git，无法生成不可变制品标识"
+command -v tar >/dev/null 2>&1 || fail "缺少 tar"
+command -v sha256sum >/dev/null 2>&1 || fail "缺少 sha256sum"
+
+java_version=$($JAVA_BIN -version 2>&1)
+printf '%s\n' "$java_version"
+printf '%s\n' "$java_version" | grep -F "$EXPECTED_RUNTIME_MARKER" >/dev/null || \
+  fail "必须精确使用 Eclipse Temurin ${EXPECTED_RUNTIME_VERSION}"
+
+revision=$(git rev-parse --verify HEAD 2>/dev/null) || fail "无法读取 Git revision"
+short_revision=$(printf '%s' "$revision" | cut -c1-12)
+artifact=${APP_NAME}-${APP_VERSION}-${short_revision}-linux-x64-jre${EXPECTED_RUNTIME_VERSION}
+archive=${artifact}.tar.gz
+
+rm -rf "$INPUT_DIR" "$PACKAGE_DIR"
+mkdir -p "$INPUT_DIR" "$PACKAGE_DIR"
+cp "$JAR_PATH" "$INPUT_DIR/"
+
+"$JPACKAGE_BIN" \
+  --type app-image \
+  --name "$APP_NAME" \
+  --app-version "$APP_VERSION" \
+  --input "$INPUT_DIR" \
+  --main-jar "$JAR_NAME" \
+  --main-class culvert.main \
+  --dest "$PACKAGE_DIR" \
+  --java-options "-Dfile.encoding=UTF-8" \
+  --java-options "-Duser.timezone=UTC" \
+  --java-options "-Xms128m" \
+  --java-options "-Xmx512m" \
+  --java-options "-XX:+ExitOnOutOfMemoryError"
+
+RUNTIME_DIR=${PACKAGE_DIR}/${APP_NAME}/lib/runtime
+RUNTIME_RELEASE=${RUNTIME_DIR}/release
+RUNTIME_BUILD_INFO=${RUNTIME_DIR}/runtime-build-info
+[ -r "$RUNTIME_RELEASE" ] || fail "app-image 缺少 runtime release 清单"
+grep -F "JAVA_VERSION=\"${EXPECTED_JAVA_VERSION}\"" "$RUNTIME_RELEASE" >/dev/null || \
+  fail "app-image 未包含预期的 Java ${EXPECTED_JAVA_VERSION} runtime"
+cp "${JAVA_HOME}/release" "$RUNTIME_BUILD_INFO"
+grep -F "IMPLEMENTOR=\"Eclipse Adoptium\"" "$RUNTIME_BUILD_INFO" >/dev/null || \
+  fail "runtime 构建信息缺少 Eclipse Adoptium 供应商标识"
+grep -F "JAVA_RUNTIME_VERSION=\"${EXPECTED_RUNTIME_VERSION}\"" "$RUNTIME_BUILD_INFO" >/dev/null || \
+  fail "runtime 构建信息不是 ${EXPECTED_RUNTIME_VERSION}"
+
+(
+  cd "$PACKAGE_DIR"
+  tar --create --gzip --file "$archive" "$APP_NAME"
+  sha256sum "$archive" > "$archive.sha256"
+  sha256sum --check "$archive.sha256"
+)
+
+printf '已生成 %s/%s\n' "$PACKAGE_DIR" "$archive"
+printf '内置 runtime：Eclipse Temurin %s（Java %s）\n' "$EXPECTED_RUNTIME_VERSION" "$EXPECTED_JAVA_VERSION"

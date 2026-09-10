@@ -1,0 +1,100 @@
+{
+  "images": [
+    {
+      "name": "ubuntu:22.04",
+      "entry": "/bin/bash",
+      "description": "Ubuntu 22.04 LTS"
+    },
+    {
+      "name": "ubuntu:24.04",
+      "entry": "/bin/bash",
+      "description": "Ubuntu 24.04 LTS"
+    },
+    {
+      "name": "ubuntu:latest",
+      "entry": "/bin/bash",
+      "description": "Ubuntu (latest)"
+    },
+    {
+      "name": "debian:bookworm",
+      "entry": "/bin/bash",
+      "description": "Debian 12 Bookworm"
+    },
+    {
+      "name": "debian:bullseye",
+      "entry": "/bin/bash",
+      "description": "Debian 11 Bullseye"
+    },
+    {
+      "name": "debian:latest",
+      "entry": "/bin/bash",
+      "description": "Debian (latest)"
+    },
+    { "name": "centos:7", "entry": "/bin/bash", "description": "CentOS 7" },
+    { "name": "centos:8", "entry": "/bin/bash", "description": "CentOS 8" },
+    {
+      "name": "fedora:latest",
+      "entry": "/bin/bash",
+      "description": "Fedora (latest)"
+    },
+    {
+      "name": "alpine:3.20",
+      "entry": "/bin/sh",
+      "description": "Alpine Linux 3.20"
+    },
+    {
+      "name": "alpine:3.21",
+      "entry": "/bin/sh",
+      "description": "Alpine Linux 3.21"
+    },
+    {
+      "name": "alpine:latest",
+      "entry": "/bin/sh",
+      "description": "Alpine Linux (latest)"
+    },
+    {
+      "name": "python:3.12",
+      "entry": "/bin/bash",
+      "description": "Python 3.12"
+    },
+    {
+      "name": "python:3.12-slim",
+      "entry": "/bin/bash",
+      "description": "Python 3.12 (slim)"
+    },
+    {
+      "name": "python:3.12-alpine",
+      "entry": "/bin/sh",
+      "description": "Python 3.12 (Alpine)"
+    },
+    { "name": "node:20", "entry": "/bin/bash", "description": "Node.js 20" },
+    {
+      "name": "node:20-slim",
+      "entry": "/bin/bash",
+      "description": "Node.js 20 (slim)"
+    },
+    {
+      "name": "node:20-alpine",
+      "entry": "/bin/sh",
+      "description": "Node.js 20 (Alpine)"
+    },
+    { "name": "node:22", "entry": "/bin/bash", "description": "Node.js 22" },
+    {
+      "name": "node:22-alpine",
+      "entry": "/bin/sh",
+      "description": "Node.js 22 (Alpine)"
+    },
+    { "name": "golang:1.23", "entry": "/bin/bash", "description": "Go 1.23" },
+    {
+      "name": "golang:1.23-alpine",
+      "entry": "/bin/sh",
+      "description": "Go 1.23 (Alpine)"
+    },
+    { "name": "rust:1.85", "entry": "/bin/bash", "description": "Rust 1.85" },
+    {
+      "name": "rust:1.85-alpine",
+      "entry": "/bin/sh",
+      "description": "Rust 1.85 (Alpine)"
+    }
+  ]
+}

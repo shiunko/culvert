@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+JAVA_HOME=${JAVA_HOME:-/opt/java/temurin-26.0.2+10}
+JAVA_BIN=${JAVA_BIN:-${JAVA_HOME}/bin/java}
+CULVERT_JAR=${CULVERT_JAR:-/opt/culvert/current.jar}
+JAVA_OPTS=${JAVA_OPTS:--Xms128m -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=UTC -XX:+ExitOnOutOfMemoryError -XX:ErrorFile=/var/lib/culvert/diagnostics/hs_err_pid%p.log -XX:HeapDumpPath=/var/lib/culvert/diagnostics}
+
+if [ ! -x "$JAVA_BIN" ]; then
+  echo "Java 可执行文件不存在或不可执行：$JAVA_BIN" >&2
+  exit 1
+fi
+
+java_version=$($JAVA_BIN -version 2>&1)
+printf '%s\n' "$java_version"
+case "$java_version" in
+  *Temurin-26.0.2+10*) ;;
+  *)
+    echo "必须精确使用 Eclipse Temurin 26.0.2+10。" >&2
+    exit 1
+    ;;
+esac
+
+if [ ! -r "$CULVERT_JAR" ]; then
+  echo "应用 jar 不可读：$CULVERT_JAR" >&2
+  exit 1
+fi
+
+# JAVA_OPTS 由管理员通过 /etc/culvert/culvert.env 控制。
+# shellcheck disable=SC2086
+exec "$JAVA_BIN" $JAVA_OPTS -jar "$CULVERT_JAR"
