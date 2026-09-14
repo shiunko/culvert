@@ -5,6 +5,8 @@
             [culvert.docker :as docker]
             [culvert.forward :as forward]
             [culvert.health :as health]
+            [culvert.observability.activity :as activity]
+            [culvert.probe :as probe]
             [culvert.config :as config]
             [culvert.runtime.instance-lock :as instance-lock]
             [culvert.smolvm.manager :as smolvm]
@@ -12,8 +14,39 @@
             [culvert.web.server :as web-server]
             [culvert.web.ws :as ws]))
 
+(defn- probe-targets
+  "收集需要延迟探测的 `[host port]`：仅限已启用的端口转发与反向代理目标。"
+  []
+  (concat
+   (keep (fn [e]
+           (when (not (false? (:enabled e)))
+             [(:ip e) (:toPort e)]))
+         (forward/get-entries nil true))
+   (keep (fn [e]
+           (when (and (:enabled e) (:target e))
+             (probe/parse-target (:target e))))
+         (caddy/get-entries nil true))))
+
+(defn- record-probe-transition!
+  "记录探针目标可达性的状态迁移：由可达转不可达记 warning，恢复记 info。首次探测不记。"
+  [states host port entry]
+  (let [k (probe/cache-key host port)
+        ok? (boolean (:ok? entry))
+        prev (get @states k)]
+    (swap! states assoc k ok?)
+    (when (and (some? prev) (not= prev ok?))
+      (activity/record!
+       {:actor "system"
+        :action (if ok? :probe/recovered :probe/unreachable)
+        :resource {:kind "probe" :id k}
+        :outcome (if ok? :success :failed)
+        :severity (if ok? :info :warning)
+        :summary (str (if ok? "目标恢复可达 " "目标不可达 ") k)}))))
+
 (defn default-dependencies []
-  (let [lock-handle (atom nil)]
+  (let [lock-handle (atom nil)
+        probe-handle (atom nil)
+        probe-state (atom {})]
     {:order [:instance-lock
              :sensitive-permissions
              :users
@@ -21,6 +54,7 @@
              :forwards
              :docker
              :smolvm
+             :probe
              :token-cleaner
              :web-cleaner
              :web-server
@@ -37,6 +71,11 @@
       :forwards {:start! forward/sync-forwards! :stop! forward/shutdown!}
       :docker {:start! docker/sync-containers! :stop! docker/shutdown!}
       :smolvm {:start! smolvm/sync-machines! :stop! smolvm/shutdown!}
+      :probe {:start! #(reset! probe-handle
+                               (probe/start-sampler! probe-targets
+                                                     (partial record-probe-transition! probe-state)))
+              :stop! #(do (probe/stop-sampler! @probe-handle)
+                          (reset! probe-handle nil))}
       :token-cleaner {:start! auth/start-token-cleaner! :stop! auth/stop-token-cleaner!}
       :web-cleaner {:start! web-core/start-cleaner! :stop! web-core/stop-cleaner!}
       :web-server {:start! web-server/start-server! :stop! web-server/stop-server!}
@@ -91,6 +130,12 @@
                                   (catch Throwable error error))]
                 (if start-error
                   (let [_ (health/mark-not-ready! "start-failed")
+                        _ (activity/record! {:actor "system"
+                                             :action :system/start-failed
+                                             :resource {:kind "component" :id (name id)}
+                                             :outcome :failed
+                                             :severity :error
+                                             :summary (str "组件启动失败: " (name id))})
                         {:keys [failed errors]} (stop-components components started)]
                     (reset! state {:phase (if (seq failed) :stop-failed :stopped)
                                    :started (vec (reverse failed))})

@@ -11,10 +11,14 @@
             [culvert.docker :as docker]
             [culvert.forward :as forward]
             [culvert.i18n :as i18n]
+            [culvert.observability.activity :as activity]
+            [culvert.observability.host :as host]
+            [culvert.probe :as probe]
             [culvert.s3 :as s3]
             [culvert.smolvm.cli :as smolvm-cli]
             [culvert.smolvm.manager :as smolvm]
             [culvert.web.ui.drawer :as ui.drawer]
+            [culvert.web.ui.icon :as ui.icon]
             [culvert.web.ui.popover :as ui.popover]
             [culvert.web.ui.skeleton :as ui.skeleton]
             [culvert.web.ui.tabs :as ui.tabs]))
@@ -64,27 +68,473 @@
        [:span.pf-badge.pf-badge-outline {:title (:total-mem q)}
         (:memory q) [:strong (str (:memUsage usage) "/" (get-in user [:quotas :memLimit]))]]))))
 
+;; ============================================================
+;; 统一资源视图模型（跨 forward/caddy/docker/smolvm 的只读汇总）
+;; 视图直接读领域 atom 是存量交织；这里只做「读 + 归一化」，不执行命令。
+;; ============================================================
+
+(def ^:private status-colors
+  {:alive "#55C98A" :dead "#D95D5D" :unknown "#D9A441" :disabled "#64748B"})
+
+(defn- forward-resource-key [e] (str "fwd-" (:port e) "-" (:protocol e) "-" (:method e)))
+(defn- caddy-resource-key [e] (str "caddy-" (:fullDomain e)))
+(defn- container-resource-key [c] (str "docker-" (:id c)))
+(defn- machine-resource-key [m] (str "smolvm-" (:id m)))
+
+(defn- forward-status [e]
+  (cond
+    (false? (:enabled e)) :disabled
+    (true? (:alive e)) :alive
+    (false? (:alive e)) :dead
+    :else :unknown))
+
+(defn- probe-status [host port]
+  (when (and host port)
+    (when-let [p (probe/cached host port)]
+      (if (:ok? p) :alive :dead))))
+
+(defn- resolve-status
+  "领域状态无法判定（unknown）时，用探针可达性补充；探针也无数据则保持 unknown。"
+  [base host port]
+  (if (= base :unknown)
+    (or (probe-status host port) base)
+    base))
+
+(defn- enabled-status [enabled?]
+  (if (false? enabled?) :disabled :alive))
+
+(defn- container-status [s]
+  (cond
+    (= s "running") :alive
+    (= s "stopped") :dead
+    :else :unknown))
+
+(defn- format-duration [created-at]
+  (try
+    (let [created (java.time.Instant/parse (str created-at))
+          secs (.toSeconds (java.time.Duration/between created (java.time.Instant/now)))]
+      (cond
+        (< secs 60) (str (max 0 secs) "s")
+        (< secs 3600) (str (quot secs 60) "m")
+        (< secs 86400) (str (quot secs 3600) "h")
+        :else (str (quot secs 86400) "d")))
+    (catch Exception _ nil)))
+
+(defn- forward-resources [username is-admin?]
+  (for [e (forward/get-entries username is-admin?)]
+    (let [host (:ip e)
+          port (when (:toPort e) (str (:toPort e)))]
+      {:key (forward-resource-key e)
+       :type :forward
+       :type-label "端口转发"
+       :name (if (str/blank? (:remark e))
+               (str ":" (:port e) " " (str/upper-case (:protocol e)))
+               (:remark e))
+       :ingress (str (str/upper-case (:protocol e)) " :" (:port e))
+       :engine (:method e)
+       :target (str (:ip e) ":" (:toPortDisplay e))
+       :protocol (str/upper-case (:protocol e))
+       :status (resolve-status (forward-status e) host (when port (Integer/parseInt port)))
+       :owner (:userId e)
+       :tab "forwards"
+       :host host
+       :port port
+       :created-at nil})))
+
+(defn- caddy-resources [username is-admin?]
+  (for [e (caddy/get-entries username is-admin?)]
+    (let [[host port] (probe/parse-target (:target e))]
+      {:key (caddy-resource-key e)
+       :type :caddy
+       :type-label "反向代理"
+       :name (if (str/blank? (:remark e)) (:fullDomain e) (:remark e))
+       :ingress (:fullDomain e)
+       :engine "caddy"
+       :target (:target e)
+       :protocol "HTTPS"
+       :status (enabled-status (:enabled e))
+       :owner (:userId e)
+       :tab "forwards"
+       :subtab "forward-caddy"
+       :host host
+       :port port
+       :created-at nil})))
+
+(defn- container-resources [username is-admin?]
+  (for [c (docker/get-containers username is-admin?)
+        :let [port (first (filter #(get-in c [:ports % :enabled]) (keys (:ports c))))]]
+    {:key (container-resource-key c)
+     :type :container
+     :type-label "容器"
+     :name (:name c)
+     :ingress (if port (str ":" port) "—")
+     :engine (:container-cli config)
+     :target (:name c)
+     :protocol "TCP"
+     :status (container-status (:status c))
+     :owner (:userId c)
+     :tab "docker"
+     :host (when port "127.0.0.1")
+     :port port
+     :created-at (:createdAt c)}))
+
+(defn- machine-resources [username is-admin?]
+  (for [m (smolvm/get-machines username is-admin?)
+        :let [port (first (filter #(get-in m [:ports % :enabled]) (keys (:ports m))))]]
+    {:key (machine-resource-key m)
+     :type :vm
+     :type-label "微虚机"
+     :name (:name m)
+     :ingress (if port (str ":" port) "—")
+     :engine "smolvm"
+     :target (:name m)
+     :protocol "TCP"
+     :status (container-status (:status m))
+     :owner (:userId m)
+     :tab "smolvm"
+     :host (when port "127.0.0.1")
+     :port port
+     :created-at (:createdAt m)}))
+
+(defn all-resources
+  "汇总当前用户可见的全部资源（forward/caddy/docker/smolvm），供总览可视化使用。"
+  [username is-admin?]
+  (concat (forward-resources username is-admin?)
+          (when-not (:ip-mode config) (caddy-resources username is-admin?))
+          (container-resources username is-admin?)
+          (machine-resources username is-admin?)))
+
+(defn- status-label [status]
+  (let [sts (:status i18n/strings)]
+    (case status
+      :alive (:running-text sts)
+      :dead (:dead sts)
+      :disabled (:disabled sts)
+      (:unknown sts))))
+
+(defn- status-badge-class [status]
+  (case status
+    :alive "pf-badge-success"
+    :dead "pf-badge-error"
+    :disabled "pf-badge-ghost"
+    "pf-badge-warning"))
+
+(defn- status-badge [status]
+  [:span.pf-badge {:class (status-badge-class status)}
+   [:span.pf-legend-dot {:style (str "background:" (get status-colors status "#D9A441"))}]
+   (status-label status)])
+
+(defn- latency-text [r]
+  (if (and (:host r) (:port r))
+    (if-let [p (probe/cached (:host r) (:port r))]
+      (if (:ok? p) (str (:latency-ms p) " ms") "不可达")
+      "—")
+    "—"))
+
+(defn- latency-cell [r]
+  (list
+   [:div (if (and (:host r) (some? (:port r)))
+           (if-let [p (probe/cached (:host r) (:port r))]
+             (if (:ok? p)
+               [:span (str (:latency-ms p) " ms")]
+               [:span.pf-text-error "不可达"])
+             [:span.pf-text-muted "—"])
+           [:span.pf-text-muted "—"])]
+   (when-let [d (some-> (:created-at r) format-duration)]
+     [:div.pf-text-muted {:style "font-size:0.68rem"} (str "运行 " d)])))
+
+;; ============================================================
+;; 总览：横幅 + 配额环 + KPI
+;; ============================================================
+
+(defn- percentage [used limit]
+  (if (and limit (pos? limit))
+    (min 100 (long (Math/round (* 100.0 (/ (double used) (double limit))))))
+    0))
+
 (defn render-overview-stats-content
-  "渲染总览 Tab 的资源数量摘要卡片，点击每张卡片激活对应 Tab。"
-  [username]
+  "渲染总览横幅：欢迎语 + 资源配额环 + KPI 卡。只读，不含任何 mutation。"
+  [username user]
   (let [usage (compute-usage username)
-        t (:tabs i18n/strings)]
+        is-admin? (= (:role user) "admin")
+        resources (all-resources username is-admin?)
+        forwards (filter #(= :forward (:type %)) resources)
+        active-forwards (count (filter #(= :alive (:status %)) forwards))
+        containers (count (filter #(= :container (:type %)) resources))
+        machines (count (filter #(= :vm (:type %)) resources))
+        abnormal (count (filter #(#{:dead :unknown} (:status %)) resources))
+        quotas (or (:quotas user) (auth/get-default-quotas))
+        port-used (:portForwards usage)
+        port-limit (:portForwards quotas)
+        pct (percentage port-used port-limit)]
     (h/html
-     [:div.pf-stat-grid
-      [:button.pf-stat-card {:type "button" :data-action "tabs.activate" :data-tab "forwards"}
-       [:span.pf-stat-label (:stat-forwards t)]
-       [:span.pf-stat-value (:portForwards usage)]]
-      (when-not (:ip-mode config)
-        [:button.pf-stat-card {:type "button" :data-action "tabs.activate" :data-tab "caddy"}
-         [:span.pf-stat-label (:stat-caddy t)]
-         [:span.pf-stat-value (:reverseProxies usage)]])
-      [:button.pf-stat-card {:type "button" :data-action "tabs.activate" :data-tab "docker"}
-       [:span.pf-stat-label (:stat-docker t)]
-       [:span.pf-stat-value (:containers usage)]]
-      (when (or (:smolvm-available? config) (pos? (:smolvmMachines usage)))
-        [:button.pf-stat-card {:type "button" :data-action "tabs.activate" :data-tab "smolvm"}
-         [:span.pf-stat-label (:stat-smolvm t)]
-         [:span.pf-stat-value (:smolvmMachines usage)]])])))
+     [:section.pf-hero
+      [:div.pf-hero-lead
+       [:div.pf-hero-icon (ui.icon/icon :zap {:size 24})]
+       [:div
+        [:div.pf-hero-eyebrow "欢迎回来，" [:span (str username)]]
+        [:h2.pf-hero-title "资源拓扑监控与运维控制台"]]]
+      [:div.pf-kpi-row
+       [:div.pf-quota-ring
+        [:div.pf-quota-ring-visual
+         [:svg {:viewBox "0 0 36 36"}
+          [:path.pf-quota-ring-track {:stroke-width 3.5 :fill "none"
+                                      :d "M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"}]
+          [:path.pf-quota-ring-value {:stroke-width 3.5 :stroke-linecap "round" :fill "none"
+                                      :stroke-dasharray (str pct ", 100")
+                                      :d "M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"}]]
+         [:span.pf-quota-ring-pct (str pct "%")]]
+        [:div
+         [:div.pf-kpi-label "资源配额"]
+         [:div.pf-kpi-sub (str "端口已占 " port-used " / " (or port-limit "—"))]]]
+       [:button.pf-kpi {:type "button" :data-action "tabs.activate" :data-tab "forwards"}
+        [:span.pf-kpi-label "活跃转发"]
+        [:span.pf-kpi-value.pf-kpi-value--accent (str active-forwards)]
+        [:span.pf-kpi-sub (str "共 " (count forwards) " 条规则")]]
+       [:button.pf-kpi {:type "button" :data-action "tabs.activate" :data-tab "docker"}
+        [:span.pf-kpi-label "容器数量"]
+        [:span.pf-kpi-value.pf-kpi-value--indigo (str containers)]
+        [:span.pf-kpi-sub "资源统计"]]
+       (when (or (:smolvm-available? config) (pos? machines))
+         [:button.pf-kpi {:type "button" :data-action "tabs.activate" :data-tab "smolvm"}
+          [:span.pf-kpi-label "微虚机"]
+          [:span.pf-kpi-value.pf-kpi-value--indigo (str machines)]
+          [:span.pf-kpi-sub "资源统计"]])
+       [:button.pf-kpi.pf-kpi--danger {:type "button" :data-action "tabs.activate" :data-tab "forwards"}
+        [:span.pf-kpi-label "异常告警"]
+        [:span.pf-kpi-value.pf-kpi-value--danger (str abnormal)]
+        [:span.pf-kpi-sub "需要关注"]]]])))
+
+;; ============================================================
+;; 总览：资源接线图
+;; ============================================================
+
+(defn- topo-connector [status]
+  (let [stroke (get status-colors status "#D9A441")
+        alive? (= status :alive)
+        disabled? (= status :disabled)]
+    [:div.pf-topo-connector
+     [:svg {:viewBox "0 0 50 20" :preserveAspectRatio "none"}
+      [:path (cond-> {:d "M 2 10 L 44 10" :stroke stroke :stroke-width 1.5 :fill "none"}
+               alive? (assoc :class "pf-flow-dash")
+               disabled? (assoc :stroke-dasharray "4 3" :opacity 0.4))]
+      [:polygon {:points "44,5 50,10 44,15" :fill stroke
+                 :opacity (if disabled? 0.4 0.9)}]]]))
+
+(defn- topo-row [r]
+  (let [status (:status r)
+        stroke (get status-colors status "#D9A441")]
+    [:div.pf-topo-row
+     {:data-resource-key (:key r)
+      :data-tab (:tab r)
+      :data-focus-resource (:key r)
+      :data-action "tabs.activate"
+      :data-subtab-target (when (:subtab r) (:subtab r))
+      :title "点击跳转至该资源列表并高亮定位"}
+     [:div.pf-topo-ingress
+      [:span.pf-topo-ingress-value (:ingress r)]
+      [:span.pf-topo-ingress-name (:name r)]]
+     (topo-connector status)
+     [:div.pf-topo-engine
+      [:div.pf-topo-engine-chip {:data-status (name status)}
+       [:span.pf-topo-engine-main
+        [:span.pf-topo-dot {:style (str "background:" stroke
+                                        (when (= status :alive) (str ";box-shadow:0 0 8px " stroke)))}]
+        [:span (:engine r)]]
+       [:span.pf-topo-proto (:protocol r)]]]
+     (topo-connector status)
+     [:div.pf-topo-target
+      [:div
+       [:span.pf-topo-target-main (:target r)]
+       [:span.pf-topo-target-lat (latency-text r)]]]]))
+
+(defn- degraded-item [r]
+  [:div.pf-degraded-item
+   {:data-resource-key (:key r) :data-tab (:tab r) :data-focus-resource (:key r)
+    :data-action "tabs.activate"
+    :data-subtab-target (when (:subtab r) (:subtab r))}
+   [:div.pf-degraded-top
+    [:span (str (:ingress r)) " → " (:target r)]
+    (status-badge (:status r))]
+   [:div.pf-degraded-sub
+    [:span (:engine r) " · " (:protocol r) " · " (:name r)]
+    [:span "定位 →"]]])
+
+(def ^:private topo-limit 5)
+
+(defn render-topology-content
+  "渲染资源接线图内部内容：桌面栅格接线 + 窄屏降级列表。"
+  [username is-admin?]
+  (let [resources (vec (all-resources username is-admin?))
+        shown (vec (take topo-limit resources))
+        total-forwards (count (filter #(= :forward (:type %)) resources))
+        shown-forwards (count (filter #(= :forward (:type %)) shown))
+        remaining (max 0 (- total-forwards shown-forwards))]
+    (h/html
+     [:div.pf-card-head
+      [:h3.pf-card-head-title
+       [:span.pf-live-dot]
+       "资源接线图"
+       [:span.pf-tag "Topology View"]]
+      [:div.pf-legend
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#55C98A"}] "运行中"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#D95D5D"}] "异常"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#D9A441"}] "未知"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#64748B"}] "禁用"]]]
+     (if (empty? shown)
+       [:div.pf-topo-empty "暂无资源，先在转发或容器页面创建"]
+       (list
+        [:div.pf-topo-desktop
+         [:div.pf-topo-head
+          [:span.pf-topo-head-ingress "公网入口 (Ingress)"]
+          [:span.pf-topo-head-center "连接"]
+          [:span.pf-topo-head-engine "服务引擎 (Engine)"]
+          [:span.pf-topo-head-center "连接"]
+          [:span.pf-topo-head-target "内网目标 (Target)"]]
+         [:div.pf-topo-rows (for [r shown] (topo-row r))]]
+        [:div.pf-topo-narrow
+         [:div.pf-degraded-rows (for [r shown] (degraded-item r))]]))
+     [:div.pf-topo-foot
+      [:span "每条资源独立一行，避免连线交叉。点击整条连接可定位并跳转。"]
+      (when (pos? remaining)
+        [:button.pf-topo-more {:type "button" :data-action "tabs.activate" :data-tab "forwards"}
+         (str "还有 " remaining " 条转发，进入转发列表查看全部")
+         (ui.icon/icon :arrow-right-left {:size 12})])])))
+
+;; ============================================================
+;; 总览：端口频谱
+;; ============================================================
+
+(defn- reserved-segments []
+  (let [pf (:port-forward-range config)]
+    (cond-> []
+      (and pf (:start pf) (:end pf))
+      (conj {:key "reserved-forward" :start (:start pf) :end (:end pf) :reserved? true
+             :label (str "转发预留 " (:start pf) "-" (:end pf)) :service "端口转发范围" :owner "系统预留"})
+      (and (:smolvm-port-start config) (:smolvm-port-end config))
+      (conj {:key "reserved-smolvm" :start (:smolvm-port-start config) :end (:smolvm-port-end config)
+             :reserved? true :label (str "微虚机预留 " (:smolvm-port-start config) "-" (:smolvm-port-end config))
+             :service "SmolVM 端口池" :owner "系统预留"})
+      (and (:ttyd-port-start config) (:ttyd-port-end config))
+      (conj {:key "reserved-ttyd" :start (:ttyd-port-start config) :end (:ttyd-port-end config)
+             :reserved? true :label (str "Shell 预留 " (:ttyd-port-start config) "-" (:ttyd-port-end config))
+             :service "ttyd 端口池" :owner "系统预留"}))))
+
+(defn port-segments
+  "构造端口频谱段：forward/docker/smolvm 的真实端口 + 系统预留范围。"
+  [username is-admin?]
+  (concat
+   (for [e (forward/get-entries username is-admin?)
+         :when (:enabled e)]
+     (let [start (if (:isRange e) (:fromPort e) (Integer/parseInt (str (:port e))))]
+       {:key (forward-resource-key e)
+        :start start
+        :end (if (:isRange e) (:toRangePort e) start)
+        :label (str ":" start " " (str/upper-case (:protocol e)))
+        :service (str (:method e) " → " (:ip e) ":" (:toPortDisplay e))
+        :owner (:userId e)
+        :status (forward-status e)
+        :protocol (str/upper-case (:protocol e))
+        :resource-key (forward-resource-key e)
+        :tab "forwards"}))
+   (for [c (docker/get-containers username is-admin?)
+         p (keys (:ports c))
+         :when (get-in c [:ports p :enabled])]
+     {:key (str (container-resource-key c) "-" p)
+      :start (Integer/parseInt (str p))
+      :end (Integer/parseInt (str p))
+      :label (str ":" p)
+      :service (str (:name c) " → " (:name c))
+      :owner (:userId c)
+      :status (container-status (:status c))
+      :protocol "TCP"
+      :resource-key (container-resource-key c)
+      :tab "docker"})
+   (for [m (smolvm/get-machines username is-admin?)
+         p (keys (:ports m))
+         :when (get-in m [:ports p :enabled])]
+     {:key (str (machine-resource-key m) "-" p)
+      :start (Integer/parseInt (str p))
+      :end (Integer/parseInt (str p))
+      :label (str ":" p)
+      :service (str (:name m) " → " (:name m))
+      :owner (:userId m)
+      :status (container-status (:status m))
+      :protocol "TCP"
+      :resource-key (machine-resource-key m)
+      :tab "smolvm"})
+   (reserved-segments)))
+
+(defn- spectrum-segment [seg]
+  (let [cls (cond-> "pf-seg"
+              (:reserved? seg) (str " pf-seg--reserved")
+              (:reserved? seg) (str " pf-striped-reserved"))]
+    [:button {:type "button"
+              :class cls
+              :data-status (when-not (:reserved? seg) (name (or (:status seg) :unknown)))
+              :data-proto (or (:protocol seg) "ALL")
+              :data-resource-key (:resource-key seg)
+              :data-tab (:tab seg)
+              :data-seg-label (:label seg)
+              :data-seg-service (:service seg)
+              :data-seg-owner (:owner seg)
+              :data-seg-status (if (:reserved? seg)
+                                 "系统预留"
+                                 (status-label (or (:status seg) :unknown)))
+              :title (:label seg)}
+     [:span.pf-seg-port (if (:reserved? seg) "预留" (str ":" (:start seg)))]
+     [:span.pf-seg-proto (if (:reserved? seg) "RANGE" (or (:protocol seg) ""))]]))
+
+(defn- spectrum-band [band segments]
+  (let [items (filterv (fn [s]
+                         (case band
+                           "low" (<= (:start s) 1024)
+                           "mid" (and (> (:start s) 1024) (<= (:start s) 8192))
+                           (and (> (:start s) 8192) (<= (:start s) 65535))))
+                       segments)]
+    [:div.pf-spectrum-band {:data-band band}
+     (if (empty? items)
+       [:div.pf-spectrum-empty "空闲"]
+       (for [s items] (spectrum-segment s)))]))
+
+(defn render-port-spectrum-content
+  "渲染端口频谱内部内容：三段视觉带（低端口 45% / 中 30% / 高 25%）+ 协议筛选 + 详情条。"
+  [username is-admin?]
+  (let [segments (vec (port-segments username is-admin?))]
+    (h/html
+     [:div.pf-card-head
+      [:h3.pf-card-head-title
+       (ui.icon/icon :layers {:size 16})
+       "端口频谱"
+       [:span.pf-tag "Port Spectrum"]
+       [:span.pf-text-muted {:style "font-size:0.7rem"} "范围 0 – 65535"]]
+      [:div.pf-proto-filter {:role "group" :aria-label "协议筛选"}
+       [:button {:type "button" :data-action "spectrum.filter" :data-proto "ALL" :aria-pressed "true"} "全部协议"]
+       [:button {:type "button" :data-action "spectrum.filter" :data-proto "TCP" :aria-pressed "false"} "TCP"]
+       [:button {:type "button" :data-action "spectrum.filter" :data-proto "UDP" :aria-pressed "false"} "UDP"]]]
+     [:div.pf-spectrum-bandlabel
+      [:span.pf-spectrum-bandlabel-low
+       [:span.pf-legend-dot {:style "background:#22d3ee"}]
+       "低端口区间 (0 - 1024，视觉放大)"]
+      [:span "动态与高端口区间 (1025 - 65535)"]]
+     [:div.pf-spectrum-track {:id "port-spectrum-track"}
+      (spectrum-band "low" segments)
+      (spectrum-band "mid" segments)
+      (spectrum-band "high" segments)]
+     [:div.pf-spectrum-ticks
+      [:span "0"] [:span "1k"] [:span "8k"] [:span "32k"] [:span "65k"]]
+     [:div.pf-spectrum-detail {:id "port-spectrum-detail"}
+      [:span.pf-spectrum-detail-hint
+       (ui.icon/icon :info {:size 14})
+       "悬停上方色块查看端口分配、关联资源与负责人，点击色块可跳转定位。"]]
+     [:div.pf-card-head {:style "border-bottom:none;margin-bottom:0;padding-bottom:0;margin-top:0.5rem"}
+      [:div.pf-legend
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#55C98A;border-radius:0.2rem"}] "已占用正常"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#D95D5D;border-radius:0.2rem"}] "异常冲突"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#D9A441;border-radius:0.2rem"}] "高延迟/告警"]
+       [:span.pf-legend-item [:span.pf-legend-dot.pf-striped-reserved {:style "background:#334155;border-radius:0.2rem"}]
+        "预留端口范围（斜纹）"]]
+      [:span.pf-spectrum-note "* 低端口区间视觉放大，不代表实际端口数学比例。"]])))
 
 ;; --- 模块化渲染函数 ---
 
@@ -96,6 +546,113 @@
    [:span.pf-text-success.pf-mono used]
    " / "
    [:input.pf-input.pf-input-inline (merge {:size 4} input-attrs)]))
+
+;; ============================================================
+;; 管理页：单机主机指标（真实数据，缺失项显示 —）
+;; ============================================================
+
+(defn- format-bytes [b]
+  (when (number? b)
+    (let [units ["B" "KB" "MB" "GB" "TB"]]
+      (loop [value (double b)
+             idx 0]
+        (if (or (< value 1024) (= idx (dec (count units))))
+          (format "%.1f %s" value (nth units idx))
+          (recur (/ value 1024) (inc idx)))))))
+
+(defn- format-seconds [secs]
+  (when (number? secs)
+    (cond
+      (< secs 60) (str (max 0 secs) "s")
+      (< secs 3600) (str (quot secs 60) "m")
+      (< secs 86400) (str (quot secs 3600) "h")
+      :else (str (quot secs 86400) "d"))))
+
+(defn- forward-port-count [username is-admin?]
+  (reduce + 0
+          (for [e (forward/get-entries username is-admin?)]
+            (if (:isRange e) (inc (- (:toRangePort e) (:fromPort e))) 1))))
+
+(defn- published-port-count [username is-admin?]
+  (+ (reduce + 0 (for [c (docker/get-containers username is-admin?)
+                       [_ pi] (:ports c)
+                       :when (:enabled pi)] 1))
+     (reduce + 0 (for [m (smolvm/get-machines username is-admin?)
+                       [_ pi] (:ports m)
+                       :when (:enabled pi)] 1))))
+
+(defn port-pool-usage
+  "由 config 端口池区间与四域真实占用计算端口池使用量。纯读，不发命令。"
+  [username is-admin?]
+  (let [ranges (cond-> []
+                 (:port-forward-range config) (conj (:port-forward-range config))
+                 (and (:smolvm-port-start config) (:smolvm-port-end config))
+                 (conj {:start (:smolvm-port-start config) :end (:smolvm-port-end config)})
+                 (and (:ttyd-port-start config) (:ttyd-port-end config))
+                 (conj {:start (:ttyd-port-start config) :end (:ttyd-port-end config)}))
+        total (reduce + 0 (map #(inc (- (:end %) (:start %))) ranges))
+        used (+ (forward-port-count username is-admin?) (published-port-count username is-admin?))]
+    {:total total
+     :used used
+     :used-pct (when (pos? total)
+                 (long (Math/round (* 100.0 (/ (double used) (double total))))))}))
+
+(defn- meter-level [pct]
+  (cond
+    (nil? pct) nil
+    (>= pct 80) "error"
+    (>= pct 50) "warning"
+    :else "normal"))
+
+(defn- host-meter [label value pct note]
+  [:div.pf-host-meter
+   [:div.pf-host-meter-head
+    [:span.pf-host-meter-label label]
+    [:span.pf-host-meter-value (or value "—")]]
+   [:div.pf-meter-track
+    [:div.pf-meter-fill {:data-level (meter-level pct) :style (str "width:" (or pct 0) "%")}]]
+   (when (seq note)
+     [:div.pf-host-meter-note note])])
+
+(defn render-host-metrics-content
+  "渲染单机主机指标卡内部内容：CPU 负载 / 内存 / 磁盘 / 端口池，各一条进度条。
+   非 Linux 平台或缺数据时显示 — 并给出说明，不伪造数字。"
+  [username is-admin?]
+  (let [h (host/snapshot)
+        pool (port-pool-usage username is-admin?)
+        running-containers (count (filter #(= (:status %) "running") (docker/get-containers username is-admin?)))
+        running-machines (count (filter #(= (:status %) "running") (smolvm/get-machines username is-admin?)))
+        cpu (:cpu h)
+        memory (:memory h)
+        disk (:disk h)
+        hostname (or (System/getenv "HOSTNAME") "本机")
+        cpu-value (when (and (:load-average cpu) (:cores cpu))
+                    (format "%.2f / %d 核" (double (:load-average cpu)) (:cores cpu)))
+        mem-value (when memory
+                    (str (format-bytes (* 1024 (:used-kb memory)))
+                         " / " (format-bytes (* 1024 (:total-kb memory)))))
+        disk-value (when disk
+                     (str (format-bytes (:used-bytes disk))
+                          " / " (format-bytes (:total-bytes disk))))
+        pool-value (str (:used pool) " / " (:total pool) " 个端口")]
+    (h/html
+     [:div.pf-card-head
+      [:h3.pf-card-head-title
+       (ui.icon/icon :server {:size 16})
+       (str "本机节点 · " hostname)]
+      [:span.pf-tag (if h (:platform h) "指标不可用")]]
+     [:div.pf-host-grid
+      (host-meter "CPU 负载（1 分钟均值）" cpu-value (:used-pct cpu)
+                  (when-not (:load-average cpu) "当前平台无法读取系统负载"))
+      (host-meter "内存" mem-value (:used-pct memory)
+                  (when-not memory "非 Linux 平台暂不支持系统内存读取"))
+      (host-meter "磁盘（数据目录）" disk-value (:used-pct disk)
+                  (when-not disk "无法读取数据目录磁盘信息"))
+      (host-meter "端口池" pool-value (:used-pct pool)
+                  "端口转发 / 容器 / 微虚机已占用端口数")]
+     [:div.pf-host-foot
+      [:span (str "运行容器 " running-containers " · 微虚机 " running-machines)]
+      [:span (str "控制面运行时长 " (or (some-> (:uptime-seconds h) format-seconds) "—"))]])))
 
 (defn render-users-tbody [csrf-token]
   (let [all-users (auth/get-all-users)]
@@ -171,10 +728,10 @@
        [:tr
         [:td {:colspan 6}
          [:div.pf-empty
-          [:div {:style "font-size:2rem;opacity:0.4"} "🐳"]
+          (ui.icon/icon :box {:size 32})
           [:span (:no-host-containers (:empty i18n/strings))]]]]
        (for [hc sorted]
-         [:tr {:style (when-not (:assignedUser hc) (str "border-left:3px solid var(--pf-color-warning)"))
+         [:tr {:style (when-not (:assignedUser hc) "border-left:3px solid var(--pf-color-warning)")
                :data-state (or (:state hc) "other")}
           [:td [:code (:name hc)]]
           [:td [:code.pf-text-muted
@@ -191,9 +748,9 @@
              :else [:span.pf-text-muted (:state hc)])]
           [:td
            (if (:assignedUser hc)
-             [:span.pf-badge.pf-badge-info "👤 " (:assignedUser hc)]
+             [:span.pf-badge.pf-badge-info (ui.icon/icon :user {:size 12}) (:assignedUser hc)]
              [:span.pf-badge.pf-badge-warning
-              "⚠️ " (:container-unassigned dash)])]
+              (ui.icon/icon :alert-triangle {:size 12}) (:container-unassigned dash)])]
           [:td
            [:div {:style "display:flex;flex-direction:column;gap:0.25rem"}
             (if (:assignedUser hc)
@@ -239,98 +796,111 @@
   (let [entries (forward/get-entries username is-admin?)]
     (h/html
      (if (empty? entries)
-       [:tr [:td {:colspan (if is-admin? 9 8) :class "pf-empty"} (:no-forwards (:empty i18n/strings))]]
+       [:tr [:td {:colspan 9 :class "pf-empty"} (:no-forwards (:empty i18n/strings))]]
        (for [e entries]
-         [:tr
-          (when is-admin? [:td [:code (:userId e)]])
-          [:td [:code (:port e)]
-           (when (:isRange e)
-             [:span.pf-text-muted {:style "font-size:0.75rem"} ((:port-range-count (:status i18n/strings)) (- (:toRangePort e) (:fromPort e) -1))])]
-          [:td (str/upper-case (:protocol e))]
-          [:td [:code (:ip e)]]
-          [:td [:code (:toPortDisplay e)]
-           (when (:isRange e)
-             (list [:br]
-                   [:span.pf-text-muted {:style "font-size:0.75rem"} (format "(%d→%s, ..., %d→%s)"
-                                                                             (:fromPort e) (:toPort e)
-                                                                             (:toRangePort e)
-                                                                             (last (str/split (:toPortDisplay e) #"-")))]))]
-          [:td (:method e)]
-          [:td.remark-cell (:remark e)]
-          [:td.status-cell
-           (cond
-             (false? (:enabled e)) [:span.pf-badge.pf-badge-ghost {:title (:title-manual-stop (:status i18n/strings))} (:disabled (:status i18n/strings))]
-             (true? (:alive e)) [:span.pf-badge.pf-badge-success {:title (:title-process-running (:status i18n/strings))} (:running-text (:status i18n/strings))]
-             (false? (:alive e)) [:span.pf-badge.pf-badge-error {:title (:title-partial-dead (:status i18n/strings))} (:dead (:status i18n/strings))]
-             :else [:span.pf-text-muted {:title (:title-cant-detect (:status i18n/strings))} (:unknown (:status i18n/strings))])]
-          [:td.actions-col
-           [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
-            {:title (:edit-remark (:tooltip i18n/strings))
-             :hx-get (str "/forward/remark-form?port=" (:port e)
-                          "&protocol=" (:protocol e)
-                          "&method=" (:method e)
-                          "&remark=" (java.net.URLEncoder/encode (or (:remark e) "") "UTF-8"))
-             :hx-target "closest .remark-cell"
-             :hx-swap "innerHTML"}
-            "✏️"]
-           [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
-            {:title (if (false? (:enabled e)) (:enable (:tooltip i18n/strings)) (:disable (:tooltip i18n/strings)))
-             :hx-post "/toggle"
-             :hx-target "#forward-tbody"
-             :hx-swap "innerHTML"
-             :hx-vals (mutation-vals csrf-token {:port (:port e) :protocol (:protocol e) :method (:method e)})}
-            (if (false? (:enabled e)) "▶️" "⏸️")]
-           [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
-            {:title (:delete (:tooltip i18n/strings))
-             :hx-post "/remove"
-             :hx-target "#forward-tbody"
-             :hx-swap "innerHTML"
-             :hx-confirm (:delete-forward (:confirm i18n/strings))
-             :hx-vals (mutation-vals csrf-token {:port (:port e) :protocol (:protocol e) :method (:method e)})}
-            (:delete (:button i18n/strings))]]])))))
+         (let [resource {:key (forward-resource-key e)
+                         :host (:ip e)
+                         :port (str (:toPort e))
+                         :created-at nil
+                         :status (resolve-status (forward-status e) (:ip e) (:toPort e))}]
+           [:tr {:data-resource-key (:key resource)
+                 :data-status (name (:status resource))
+                 :data-search (str/lower-case
+                               (str (:port e) " " (:protocol e) " " (:ip e) " " (:toPortDisplay e)
+                                    " " (:method e) " " (:remark e) " " (:userId e)))}
+            [:td.remark-cell
+             [:div {:style "font-weight:600"}
+              (if (str/blank? (:remark e))
+                (str ":" (:port e) " " (str/upper-case (:protocol e)))
+                (:remark e))]
+             [:div.pf-text-muted {:style "font-size:0.68rem"} (:userId e)]]
+            [:td
+             [:code.pf-text-info (:port e)]
+             (when (:isRange e)
+               [:span.pf-text-muted {:style "font-size:0.72rem;display:block"}
+                ((:port-range-count (:status i18n/strings)) (- (:toRangePort e) (:fromPort e) -1))])]
+            [:td [:span.pf-badge.pf-badge-outline (:method e)]]
+            [:td [:code (str (:ip e) ":" (:toPortDisplay e))]]
+            [:td.pf-mono (str/upper-case (:protocol e))]
+            [:td.latency-cell (latency-cell resource)]
+            [:td.status-cell (status-badge (:status resource))]
+            [:td.pf-mono (:userId e)]
+            [:td.actions-col
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
+              {:title (:edit-remark (:tooltip i18n/strings))
+               :hx-get (str "/forward/remark-form?port=" (:port e)
+                            "&protocol=" (:protocol e)
+                            "&method=" (:method e)
+                            "&remark=" (java.net.URLEncoder/encode (or (:remark e) "") "UTF-8"))
+               :hx-target "closest .remark-cell"
+               :hx-swap "innerHTML"}
+              (ui.icon/icon :pencil {:size 14})]
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
+              {:title (if (false? (:enabled e)) (:enable (:tooltip i18n/strings)) (:disable (:tooltip i18n/strings)))
+               :hx-post "/toggle"
+               :hx-target "#forward-tbody"
+               :hx-swap "innerHTML"
+               :hx-vals (mutation-vals csrf-token {:port (:port e) :protocol (:protocol e) :method (:method e)})}
+              (ui.icon/icon (if (false? (:enabled e)) :play :pause) {:size 14})]
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
+              {:title (:delete (:tooltip i18n/strings))
+               :hx-post "/remove"
+               :hx-target "#forward-tbody"
+               :hx-swap "innerHTML"
+               :hx-confirm (:delete-forward (:confirm i18n/strings))
+               :hx-vals (mutation-vals csrf-token {:port (:port e) :protocol (:protocol e) :method (:method e)})}
+              (ui.icon/icon :trash-2 {:size 14})]]]))))))
 
 (defn render-caddy-tbody [username is-admin? csrf-token]
   (let [caddy-entries (caddy/get-entries username is-admin?)]
     (h/html
      (if (empty? caddy-entries)
-       [:tr [:td {:colspan (if is-admin? 8 7) :class "pf-empty"} (:no-caddy (:empty i18n/strings))]]
+       [:tr [:td {:colspan 9 :class "pf-empty"} (:no-caddy (:empty i18n/strings))]]
        (for [e caddy-entries]
-         [:tr
-          (when is-admin? [:td [:code (:userId e)]])
-          [:td [:code (:domain e)]]
-          [:td [:code (:worker e)]]
-          [:td [:code (:fullDomain e)]
-           (when-not (:enabled e) [:span.pf-text-muted {:style "margin-left:0.25rem"} (:disabled-text (:status i18n/strings))])]
-          [:td [:code (:target e)]]
-          [:td.remark-cell (:remark e)]
-          [:td.status-cell
-           (if (false? (:enabled e))
-             [:span.pf-badge.pf-badge-ghost {:title (:title-manual-stop (:status i18n/strings))} (:disabled (:status i18n/strings))]
-             [:span.pf-badge.pf-badge-success {:title (:title-caddy-managed (:status i18n/strings))} (:running-text (:status i18n/strings))])]
-          [:td.actions-col
-           [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
-            {:title (:edit-remark (:tooltip i18n/strings))
-             :hx-get (str "/caddy/remark-form?domain=" (:domain e)
-                          "&worker=" (:worker e)
-                          "&remark=" (java.net.URLEncoder/encode (or (:remark e) "") "UTF-8"))
-             :hx-target "closest .remark-cell"
-             :hx-swap "innerHTML"}
-            "✏️"]
-           [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
-            {:title (if (:enabled e) (:disable (:tooltip i18n/strings)) (:enable (:tooltip i18n/strings)))
-             :hx-post "/caddy/toggle"
-             :hx-target "#caddy-tbody"
-             :hx-swap "innerHTML"
-             :hx-vals (mutation-vals csrf-token {:domain (:domain e) :worker (:worker e)})}
-            (if (:enabled e) "⏸️" "▶️")]
-           [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
-            {:title (:delete (:tooltip i18n/strings))
-             :hx-post "/caddy/remove"
-             :hx-target "#caddy-tbody"
-             :hx-swap "innerHTML"
-             :hx-confirm (:delete-caddy (:confirm i18n/strings))
-             :hx-vals (mutation-vals csrf-token {:domain (:domain e) :worker (:worker e)})}
-            (:delete (:button i18n/strings))]]])))))
+         (let [[host port] (probe/parse-target (:target e))
+               resource {:key (caddy-resource-key e)
+                         :host host :port port :created-at nil
+                         :status (enabled-status (:enabled e))}]
+           [:tr {:data-resource-key (:key resource)
+                 :data-status (name (:status resource))
+                 :data-search (str/lower-case
+                               (str (:fullDomain e) " " (:target e) " caddy https "
+                                    (:remark e) " " (:userId e)))}
+            [:td.remark-cell
+             [:div {:style "font-weight:600"}
+              (if (str/blank? (:remark e)) (:fullDomain e) (:remark e))]
+             [:div.pf-text-muted {:style "font-size:0.68rem"} (:userId e)]]
+            [:td [:code.pf-text-info (:fullDomain e)]]
+            [:td [:span.pf-badge.pf-badge-outline "caddy"]]
+            [:td [:code (:target e)]]
+            [:td.pf-mono "HTTPS"]
+            [:td.latency-cell (latency-cell resource)]
+            [:td.status-cell (status-badge (:status resource))]
+            [:td.pf-mono (:userId e)]
+            [:td.actions-col
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
+              {:title (:edit-remark (:tooltip i18n/strings))
+               :hx-get (str "/caddy/remark-form?domain=" (:domain e)
+                            "&worker=" (:worker e)
+                            "&remark=" (java.net.URLEncoder/encode (or (:remark e) "") "UTF-8"))
+               :hx-target "closest .remark-cell"
+               :hx-swap "innerHTML"}
+              (ui.icon/icon :pencil {:size 14})]
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
+              {:title (if (:enabled e) (:disable (:tooltip i18n/strings)) (:enable (:tooltip i18n/strings)))
+               :hx-post "/caddy/toggle"
+               :hx-target "#caddy-tbody"
+               :hx-swap "innerHTML"
+               :hx-vals (mutation-vals csrf-token {:domain (:domain e) :worker (:worker e)})}
+              (ui.icon/icon (if (:enabled e) :pause :play) {:size 14})]
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
+              {:title (:delete (:tooltip i18n/strings))
+               :hx-post "/caddy/remove"
+               :hx-target "#caddy-tbody"
+               :hx-swap "innerHTML"
+               :hx-confirm (:delete-caddy (:confirm i18n/strings))
+               :hx-vals (mutation-vals csrf-token {:domain (:domain e) :worker (:worker e)})}
+              (ui.icon/icon :trash-2 {:size 14})]]]))))))
 
 (defn- resource-status-badge
   "docker/smolvm 卡片头共享的三态彽章（running/stopped/其他），两处逻辑完全一致，只抽取一次避免重复。"
@@ -354,6 +924,8 @@
          [:div.card.pf-resource-card {:data-container-id (:id c)
                                       :data-resource-kind "docker"
                                       :data-resource-id (:id c)
+                                      :data-resource-key (container-resource-key c)
+                                      :data-tab "docker"
                                       :data-credential-endpoint "/docker/credentials"}
           ;; -- Card header: name, status, actions --
           [:div.pf-resource-card-header
@@ -366,7 +938,7 @@
             [:button.pf-btn.pf-btn-ghost.pf-btn-xs
              {:title (:view-logs tip)
               :data-log-container (:id c)}
-             "📄"]
+             (ui.icon/icon :file-text {:size 14})]
             (when (= (:status c) "stopped")
               [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
                {:title (:start-container tip)
@@ -375,7 +947,7 @@
                 :hx-swap "innerHTML"
                 :hx-confirm (str "确定启动容器 " (:name c) " 吗？")
                 :hx-vals (mutation-vals csrf-token {:id (:id c)})}
-               "▶️"])
+               (ui.icon/icon :play {:size 14})])
             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-error
              {:title (:delete-container tip)
               :hx-post "/docker/kill"
@@ -389,16 +961,16 @@
           [:div.pf-resource-card-meta
            [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image c)]]
            [:span [:span.pf-text-muted "资源: "] [:small (str (:cpuLimit c) "C / " (:memLimit c))
-                                                (when (:gpu c) [:span.pf-text-success " 🖥️ GPU"])]]
+                                                (when (:gpu c) [:span.pf-text-success " " (ui.icon/icon :cpu {:size 12}) " GPU"])]]
            (when (:shellUrl c)
-             [:span [:span.pf-text-muted "Shell: "] [:a.pf-link {:href (:shellUrl c) :target "_blank" :rel "noopener noreferrer"} "🔗 " [:code (:shellToken c)]]])
+             [:span [:span.pf-text-muted "Shell: "] [:a.pf-link {:href (:shellUrl c) :target "_blank" :rel "noopener noreferrer"} (ui.icon/icon :external-link {:size 12}) " " [:code (:shellToken c)]]])
            (when (get-in c [:s3Mount :enabled])
              (let [sm (:s3Mount c)]
                [:span [:span.pf-text-muted "S3: "]
                 (cond
                   (= (:status sm) "mounted") [:span.pf-text-success {:title (str (:endpoint sm "AWS S3") " / " (:bucket sm) " → " (:mountPoint sm))} (:mounted sts)]
                   (= (:status sm) "error") [:span.pf-text-error {:title (str (:endpoint sm "AWS S3") " / " (:bucket sm))} (:mount-error sts)]
-                  :else [:span.pf-text-warning (str "🟡 " (:status sm))])]))]
+                  :else [:span.pf-text-warning (:status sm)])]))]
 
           ;; -- Three-column grid: Usage | Credentials | Ports --
           [:div.pf-resource-card-grid
@@ -419,11 +991,11 @@
            ;; Credentials column
            [:div.credential-cell
             [:div.pf-row
-             [:span "👤"]
+             (ui.icon/icon :user {:size 14})
              [:code.pf-mono {:style "font-size:0.75rem"} (:shellUser c)]
              [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-username tip) :data-copy (:shellUser c)} (:copy btn)]]
             [:div.pf-row
-             [:span "🔑"]
+             (ui.icon/icon :key {:size 14})
              [:input.cred-pass-input.pf-input.pf-input-inline {:style "width:6rem" :type "password" :value (:shellPassMasked c) :readonly true :data-container-id (:id c)}]
              [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:show-password tip) :data-container-id (:id c)} (:show-password btn)]
              [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-password tip) :data-copy-pass (:id c)} (:copy btn)]]]
@@ -447,7 +1019,7 @@
                          :hx-target "#docker-tbody"
                          :hx-swap "innerHTML"
                          :hx-vals (mutation-vals csrf-token {:id (:id c) :port p})}
-                        (if (:enabled pi) "⏸️" "▶️")]
+                        (ui.icon/icon (if (:enabled pi) :pause :play) {:size 13})]
                        [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
                         {:title (:unexpose tip)
                          :hx-post "/docker/port/remove"
@@ -485,6 +1057,8 @@
          [:div.card.pf-resource-card {:data-container-id (:id m)
                                       :data-resource-kind "smolvm"
                                       :data-resource-id (:id m)
+                                      :data-resource-key (machine-resource-key m)
+                                      :data-tab "smolvm"
                                       :data-credential-endpoint "/smolvm/credentials"}
           ;; -- Card header --
           [:div.pf-resource-card-header
@@ -501,7 +1075,7 @@
                 :hx-target "#smolvm-tbody"
                 :hx-swap "innerHTML"
                 :hx-vals (mutation-vals csrf-token {:id (:id m)})}
-               "▶️"])
+               (ui.icon/icon :play {:size 14})])
             (when (= (:status m) "running")
               [:button.pf-btn.pf-btn-ghost.pf-btn-xs
                {:title (:stop-machine btn)
@@ -510,14 +1084,14 @@
                 :hx-swap "innerHTML"
                 :hx-confirm ((:stop-machine cfm) (:name m))
                 :hx-vals (mutation-vals csrf-token {:id (:id m)})}
-               "⏹️"])
+               (ui.icon/icon :square {:size 14})])
             [:button.pf-btn.pf-btn-ghost.pf-btn-xs
              {:title (:pack-machine btn)
               :hx-post "/smolvm/pack"
               :hx-target "#smolvm-tbody"
               :hx-swap "innerHTML"
               :hx-vals (mutation-vals csrf-token {:id (:id m)})}
-             "📦"]
+             (ui.icon/icon :package {:size 14})]
             [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-error
              {:title (:delete-container tip)
               :hx-post "/smolvm/kill"
@@ -531,20 +1105,20 @@
           [:div.pf-resource-card-meta
            [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image m)]]
            [:span [:span.pf-text-muted "资源: "] [:small (str (:cpuLimit m) "C / " (:memLimit m) "MiB")
-                                                (when (:gpu m) [:span.pf-text-success " 🖥️ GPU"])]]
+                                                (when (:gpu m) [:span.pf-text-success " " (ui.icon/icon :cpu {:size 12}) " GPU"])]]
            (when (:shellUrl m)
-             [:span [:span.pf-text-muted "Shell: "] [:a.pf-link {:href (:shellUrl m) :target "_blank" :rel "noopener noreferrer"} "🔗 " [:code (:shellToken m)]]])]
+             [:span [:span.pf-text-muted "Shell: "] [:a.pf-link {:href (:shellUrl m) :target "_blank" :rel "noopener noreferrer"} (ui.icon/icon :external-link {:size 12}) " " [:code (:shellToken m)]]])]
 
           ;; -- Two-column grid: Credentials | Ports --
           [:div.pf-resource-card-grid
            ;; Credentials column
            [:div.credential-cell
             [:div.pf-row
-             [:span "👤"]
+             (ui.icon/icon :user {:size 14})
              [:code.pf-mono {:style "font-size:0.75rem"} (:shellUser m)]
              [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-username tip) :data-copy (:shellUser m)} (:copy btn)]]
             [:div.pf-row
-             [:span "🔑"]
+             (ui.icon/icon :key {:size 14})
              [:input.cred-pass-input.pf-input.pf-input-inline {:style "width:6rem" :type "password" :value (:shellPassMasked m) :readonly true :data-container-id (:id m)}]
              [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:show-password tip) :data-container-id (:id m)} (:show-password btn)]
              [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-password tip) :data-copy-pass (:id m)} (:copy btn)]]]
@@ -568,7 +1142,7 @@
                          :hx-target "#smolvm-tbody"
                          :hx-swap "innerHTML"
                          :hx-vals (mutation-vals csrf-token {:id (:id m) :port p})}
-                        (if (:enabled pi) "⏸️" "▶️")]
+                        (ui.icon/icon (if (:enabled pi) :pause :play) {:size 13})]
                        [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
                         {:title (:unexpose tip)
                          :hx-post "/smolvm/port/remove"
@@ -592,7 +1166,10 @@
 ;; 片段注册表、快照差异与 OOB 响应构建
 ;; ============================================================
 
-(def all-atoms [forward/state caddy/state docker/state smolvm/state])
+(def all-atoms [forward/state caddy/state docker/state smolvm/state activity/store])
+
+;; 活动记录渲染函数定义在文件靠后位置（与命令面板相邻），此处先声明以便片段注册表引用。
+(declare render-activity-content)
 
 (def ^:private fragment-registry
   "将片段 DOM id 映射到 `{:render fn, :atoms #{atom ...}}`。
@@ -623,8 +1200,24 @@
                              :atoms #{}}
    "overview-stats" {:render (fn [ctx]
                                (list [:div {:id "overview-stats"}
-                                      (render-overview-stats-content (:username ctx))]))
-                     :atoms #{forward/state caddy/state docker/state smolvm/state}}})
+                                      (render-overview-stats-content (:username ctx) (:user ctx))]))
+                     :atoms #{forward/state caddy/state docker/state smolvm/state}}
+   "topology-view" {:render (fn [ctx]
+                              (list [:div {:id "topology-view"}
+                                     (render-topology-content (:username ctx) (:is-admin ctx))]))
+                    :atoms #{forward/state caddy/state docker/state smolvm/state}}
+   "port-spectrum" {:render (fn [ctx]
+                              (list [:div {:id "port-spectrum"}
+                                     (render-port-spectrum-content (:username ctx) (:is-admin ctx))]))
+                    :atoms #{forward/state caddy/state docker/state smolvm/state}}
+   "activity-feed" {:render (fn [_ctx]
+                              (list [:div {:id "activity-feed"}
+                                     (render-activity-content)]))
+                    :atoms #{activity/store}}
+   "host-metrics" {:render (fn [ctx]
+                             (list [:div {:id "host-metrics"}
+                                    (render-host-metrics-content (:username ctx) (:is-admin ctx))]))
+                   :atoms #{}}})
 
 (defn snapshot-atoms
   "取得所有受跟踪 atom 的当前值快照。"
@@ -638,13 +1231,15 @@
                (keys before-snap))))
 
 (defn- add-oob-attr
-  "Adds hx-swap-oob=\"true\" to the top-level hiccup element."
+  "为顶层 hiccup 元素加上 `hx-swap-oob=\"innerHTML\"`。
+   用 innerHTML 而不是 true（outerHTML），是为了保留片段容器自身的 `hx-get`/`hx-trigger`/`hx-swap`
+   等属性，否则第一次 OOB 替换后轮询与 WS 刷新会失效（总览可视化面板尤其依赖此行为）。"
   [hiccup-el]
   (let [tag (first hiccup-el)
         second-el (second hiccup-el)]
     (if (map? second-el)
-      (vec (cons tag (cons (assoc second-el :hx-swap-oob "true") (nnext hiccup-el))))
-      (vec (list tag {:hx-swap-oob "true"} second-el)))))
+      (vec (cons tag (cons (assoc second-el :hx-swap-oob "innerHTML") (nnext hiccup-el))))
+      (vec (list tag {:hx-swap-oob "innerHTML"} second-el)))))
 
 (defn build-oob-response
   "构建 HTMX 响应，并为所有状态变化附加 OOB 片段。
@@ -681,6 +1276,216 @@
     (build-oob-response primary-id ctx before-snap message "error" status)))
 
 ;; ============================================================
+;; 活动记录（飞行记录仪）
+;; 展示 observability.activity 的进程内环形缓冲；只读，不触发任何修复。
+;; ============================================================
+
+(def ^:private activity-limit 30)
+
+(defn- activity-severity-class [sev]
+  (case sev
+    :error "pf-activity-item--error"
+    :warning "pf-activity-item--warning"
+    "pf-activity-item--info"))
+
+(defn- activity-severity-label [sev]
+  (case sev
+    :error "错误"
+    :warning "警告/自愈"
+    "信息"))
+
+(defn- format-activity-time [ts]
+  (try
+    (let [local (.atZone (java.time.Instant/parse (str ts)) (java.time.ZoneId/systemDefault))]
+      (format "%02d:%02d:%02d" (.getHour local) (.getMinute local) (.getSecond local)))
+    (catch Exception _ "—")))
+
+(defn- activity-resource-text [resource]
+  (when resource
+    (str (or (:kind resource) "")
+         (when (:id resource) (str " " (:id resource))))))
+
+(defn- activity-tab [resource]
+  (case (:kind resource)
+    "forward" "forwards"
+    "caddy" "forwards"
+    "container" "docker"
+    "smolvm" "smolvm"
+    nil))
+
+(defn render-activity-items
+  "渲染活动事件条目（总览活动卡与大屏共用）。`events` 为 `activity/recent` 的结果。"
+  [events]
+  (if (empty? events)
+    [:div.pf-activity-empty "暂无活动记录"]
+    (for [e events]
+      (let [resource (:resource e)
+            key (:key resource)
+            sev (:severity e)
+            tab (activity-tab resource)]
+        [:div.pf-activity-item {:class (activity-severity-class sev)
+                                :data-severity (name (or sev :info))
+                                :data-resource-key key
+                                :data-tab tab}
+         [:div.pf-activity-head
+          [:span.pf-activity-dot]
+          [:span.pf-activity-title (or (:summary e) (name (:action e)))]
+          [:span.pf-activity-sev (activity-severity-label sev)]
+          [:span.pf-activity-time (format-activity-time (:timestamp e))]]
+         [:div.pf-activity-meta
+          [:span.pf-activity-actor (or (:actor e) "系统")]
+          " · "
+          (if (and key tab)
+            [:a.pf-activity-link {:href "#" :data-resource-key key :data-tab tab
+                                  :data-subtab-target (when (= tab "forwards") "forward-port")}
+             (activity-resource-text resource)]
+            [:span (activity-resource-text resource)])
+          " · "
+          [:span.pf-text-muted (if (= (:outcome e) :failed) "失败" "成功")]]]))))
+
+(defn render-activity-content
+  "渲染总览活动记录卡内部内容（含级别客户端筛选）。"
+  []
+  (let [events (activity/recent activity-limit)
+        errors (count (filter #(= :error (:severity %)) events))
+        warnings (count (filter #(= :warning (:severity %)) events))]
+    (h/html
+     [:div.pf-card-head
+      [:h3.pf-card-head-title
+       (ui.icon/icon :activity {:size 16})
+       "活动记录"
+       [:span.pf-tag "飞行记录仪"]]
+      [:div.pf-status-filter {:role "group" :aria-label "级别筛选"}
+       [:button {:type "button" :data-action "activity.filter" :data-filter "all" :aria-pressed "true"} "全部"]
+       [:button {:type "button" :data-action "activity.filter" :data-filter "info" :aria-pressed "false"} "信息"]
+       [:button {:type "button" :data-action "activity.filter" :data-filter "warning" :aria-pressed "false"} (str "警告 " warnings)]
+       [:button {:type "button" :data-action "activity.filter" :data-filter "error" :aria-pressed "false"} (str "错误 " errors)]]]
+     [:div.pf-activity-list {:id "activity-list"} (render-activity-items events)]
+     [:div.pf-activity-foot (str "记录包含时间、操作者、资源、描述与严重程度；缓冲上限 " activity/capacity " 条。")])))
+
+;; ============================================================
+;; 命令面板（⌘K）
+;; 服务端只按角色/能力输出命令注册表；面板列表与交互由 public/console.js 从注册表构建。
+;; 面板本身不执行 mutation，命令只做导航或打开已有 Drawer/表单。
+;; ============================================================
+
+(defn- command-items [is-admin?]
+  (cond-> []
+    true
+    (conj {:id "expose-port" :category "常用命令" :label "暴露端口"
+           :description "打开转发创建抽屉，配置公网入口映射"
+           :keywords "port forward expose add 端口 转发 暴露 添加"
+           :icon :plus
+           :attrs {:data-action "drawer.open" :data-drawer "forward-drawer"}})
+    (cli/available?)
+    (conj {:id "create-container" :category "常用命令" :label "创建容器"
+           :description "打开容器创建抽屉"
+           :keywords "container docker podman 容器 创建"
+           :icon :box
+           :attrs {:data-action "drawer.open" :data-drawer "docker-drawer"}})
+    (:smolvm-available? config)
+    (conj {:id "create-machine" :category "常用命令" :label "创建虚拟机"
+           :description "打开 SmolVM 创建抽屉"
+           :keywords "vm smolvm 虚拟机 微虚机 创建"
+           :icon :server
+           :attrs {:data-action "drawer.open" :data-drawer "smolvm-drawer"}})
+    is-admin?
+    (conj {:id "manage-hosts" :category "常用命令" :label "主机容器分配"
+           :description "进入管理页的主机容器分配子页"
+           :keywords "admin manage host container 管理 主机 分配"
+           :icon :shield
+           :attrs {:data-action "tabs.activate" :data-tab "admin"}
+           :then "[data-subtab=\"admin-hosts\"]"})
+    true
+    (conj {:id "nav-overview" :category "页面跳转" :label "返回总览"
+           :description "查看首屏接线图、端口频谱与运行指标"
+           :keywords "overview dashboard home 总览 首页 概览"
+           :icon :layout-dashboard
+           :attrs {:data-action "tabs.activate" :data-tab "overview"}})
+    true
+    (conj {:id "nav-forwards" :category "页面跳转" :label "端口转发列表"
+           :description "查看并筛选所有端口转发规则"
+           :keywords "forward port 转发 端口 列表"
+           :icon :arrow-right-left
+           :attrs {:data-action "tabs.activate" :data-tab "forwards"}})
+    (not (:ip-mode config))
+    (conj {:id "nav-caddy" :category "页面跳转" :label "域名反向代理"
+           :description "进入转发页的域名反代子页"
+           :keywords "caddy domain proxy 反代 域名 代理"
+           :icon :layers
+           :attrs {:data-action "tabs.activate" :data-tab "forwards"}
+           :then "[data-subtab=\"forward-caddy\"]"})
+    true
+    (conj {:id "nav-containers" :category "页面跳转" :label "容器实例管理"
+           :description "查看容器引擎生命周期与端口绑定"
+           :keywords "container docker 容器 实例"
+           :icon :box
+           :attrs {:data-action "tabs.activate" :data-tab "docker"}})
+    (:smolvm-available? config)
+    (conj {:id "nav-machines" :category "页面跳转" :label "微虚机 SmolVM"
+           :description "查看轻量隔离微虚机状态与端口"
+           :keywords "vm smolvm 虚拟机 微虚机"
+           :icon :server
+           :attrs {:data-action "tabs.activate" :data-tab "smolvm"}})
+    is-admin?
+    (conj {:id "nav-admin" :category "页面跳转" :label "管理与配额"
+           :description "查看用户、配额与主机容器分配"
+           :keywords "admin manage quota user 管理 配额 用户"
+           :icon :settings
+           :attrs {:data-action "tabs.activate" :data-tab "admin"}})
+    true
+    (conj {:id "filter-anomalies" :category "运维诊断" :label "筛选异常资源"
+           :description "跳转转发列表并筛选异常规则"
+           :keywords "anomaly dead warning error 异常 告警 故障 不可达"
+           :icon :alert-triangle
+           :attrs {:data-action "tabs.activate" :data-tab "forwards"}
+           :then "[data-list-filter=\"forward-tbody\"][data-filter=\"dead\"]"})))
+
+(defn render-command-registry
+  "渲染隐藏的命令注册表。每个命令是一个承载真实行为属性的按钮，
+   `public/console.js` 读取它构建 ⌘K 面板列表，执行时直接 `click()` 该按钮。"
+  [is-admin?]
+  (h/html
+   [:div {:id "command-registry" :hidden true :aria-hidden "true"}
+    (for [c (command-items is-admin?)]
+      (let [attrs (merge {:type "button"
+                          :class "pf-command-source"
+                          :data-command (:id c)
+                          :data-command-label (:label c)
+                          :data-command-description (:description c)
+                          :data-command-category (:category c)
+                          :data-command-keywords (:keywords c)
+                          :data-command-then (:then c)}
+                         (:attrs c))]
+        [:button attrs
+         (ui.icon/icon (:icon c) {:size 16})
+         [:span (:label c)]]))]))
+
+(defn render-command-palette
+  "渲染命令面板覆盖层骨架（默认隐藏）。列表与筛选由 `public/console.js` 从
+   `#command-registry` 构建，无 JS 时整块隐藏、不影响既有功能。"
+  []
+  (h/html
+   [:div.pf-palette {:id "command-palette" :hidden true :role "dialog" :aria-modal "true" :aria-label "命令面板"}
+    [:button.pf-palette-backdrop {:type "button" :tabindex "-1" :aria-label "关闭命令面板" :data-action "palette.close"}]
+    [:div.pf-palette-modal
+     [:div.pf-palette-head
+      (ui.icon/icon :search {:size 18})
+      [:input.pf-palette-input {:id "command-palette-input" :type "text" :autocomplete "off" :spellcheck "false"
+                                :placeholder "搜索命令，例如：暴露端口、创建容器、Kiosk…"
+                                :role "combobox" :aria-expanded "true" :aria-controls "command-palette-list"}]
+      [:button.pf-palette-clear {:type "button" :data-action "palette.clear"} "清除"]
+      [:button.pf-palette-esc {:type "button" :data-action "palette.close"} "Esc"]]
+     [:div.pf-palette-list {:id "command-palette-list" :role "listbox" :aria-label "可用命令"}]
+     [:div.pf-palette-empty {:id "command-palette-empty" :hidden true}
+      (ui.icon/icon :search {:size 28})
+      [:p "无匹配命令"]
+      [:p "请尝试输入 暴露、容器、大屏 或 转发"]]
+     [:div.pf-palette-foot
+      [:span "↑↓ 切换选择 · Enter 执行 · Esc 关闭"]
+      [:span.pf-palette-count {:id "command-palette-count"} "0 个命令"]]]]))
+
+;; ============================================================
 ;; 控制台页面
 ;; ============================================================
 
@@ -711,44 +1516,59 @@
 
         [:header.pf-topbar
          [:div.pf-topbar-brand
-          [:span.pf-topbar-logo "🔀"] [:span (:title (:app i18n/strings))]]
+          [:span.pf-logo "CL"]
+          [:span.pf-topbar-title
+           [:span "运维控制台"]
+           [:span.pf-topbar-subtitle "Culvert"]]]
          [:div.pf-topbar-meta
           [:span.pf-ws-indicator {:id "ws-indicator" :title "WebSocket"}]
           [:div.pf-quota-chips {:id "quota-bar" :hx-get "/panel/quota" :hx-trigger "refresh-quota from:body, every 120s" :hx-swap "innerHTML"}
            (render-quota-bar-content username user)]
+          [:button.pf-cmdk {:type "button" :id "command-palette-trigger" :data-action "palette.open"
+                            :aria-haspopup "dialog" :title "按 ⌘K 或 Ctrl+K 打开命令面板"}
+           (ui.icon/icon :search {:size 14})
+           [:span.pf-cmdk-label "快捷命令"]
+           [:kbd "⌘K"]]
           [:div.pf-user-chip
-           [:span.pf-user-name (str "👤 " username)]
+           (ui.icon/icon :user {:size 14})
+           [:span.pf-user-name username]
            (if is-admin?
-             [:span.pf-badge.pf-badge-error (:user-badge-admin dash)]
+             [:span.pf-badge.pf-badge-neutral (:user-badge-admin dash)]
              [:span.pf-badge.pf-badge-neutral (:user-badge-user dash)])]]]
 
         ;; IP Mode Banner
         (when (:ip-mode config)
           [:div.pf-alert.pf-alert--info.pf-banner {:role "alert"}
-           [:svg.pf-alert-icon {:xmlns "http://www.w3.org/2000/svg" :fill "none" :viewBox "0 0 24 24" :stroke "currentColor"}
-            [:path {:stroke-linecap "round" :stroke-linejoin "round" :stroke-width "2" :d "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"}]]
+           (ui.icon/icon :info {:size 18 :class "pf-alert-icon"})
            [:span [:strong (:ip-mode-title dash)] (:ip-mode-desc dash) " " [:code (:public-ip config)] " IP:PORT 直连"]])
 
         [:nav.pf-tabs {:role "tablist" :aria-label "主导航" :id "app-tabs"}
-         (ui.tabs/tab-btn "overview" "🏠" (:overview t) true)
-         (ui.tabs/tab-btn "forwards" "🔀" (:forwards t) false)
-         (when show-caddy? (ui.tabs/tab-btn "caddy" "🌐" (:caddy t) false))
-         (ui.tabs/tab-btn "docker" "🐳" (:docker t) false)
-         (when show-smolvm? (ui.tabs/tab-btn "smolvm" "🖥️" (:smolvm t) false))
-         (when is-admin? (ui.tabs/tab-btn "admin" "🛡️" (:admin t) false))
+         (ui.tabs/tab-btn "overview" (ui.icon/icon :layout-dashboard) (:overview t) true)
+         (ui.tabs/tab-btn "forwards" (ui.icon/icon :arrow-right-left) (:forwards t) false)
+         (ui.tabs/tab-btn "docker" (ui.icon/icon :box) (:docker t) false)
+         (when show-smolvm? (ui.tabs/tab-btn "smolvm" (ui.icon/icon :server) (:smolvm t) false))
+         (when is-admin? (ui.tabs/tab-btn "admin" (ui.icon/icon :shield) (:admin t) false))
          [:span.pf-tabs-indicator {:id "tabs-indicator" :aria-hidden "true"}]]
 
         [:main.pf-content {:id "app-tab-content"}
 
          [:section.pf-panel {:id "tab-overview" :data-tab-panel "overview" :role "tabpanel" :aria-labelledby "tabbtn-overview"}
-          [:div.pf-panel-header
-           [:div
-            [:h2.pf-panel-title ((:welcome t) username)]
-            [:p.pf-panel-desc (:overview-desc t)]]]
-          [:div {:id "overview-stats" :hx-get "/panel/overview" :hx-trigger "refresh-overview from:body, every 120s"}
-           (render-overview-stats-content username)]]
+          [:div {:id "overview-stats" :hx-get "/panel/overview" :hx-trigger "refresh-overview from:body, every 120s" :hx-swap "innerHTML"}
+           (render-overview-stats-content username user)]
+          [:div.pf-overview-body
+           [:div.pf-overview-main
+            [:div {:id "topology-view" :hx-get "/panel/topology" :hx-trigger "refresh-topology from:body, every 30s" :hx-swap "innerHTML"}
+             (render-topology-content username is-admin?)]
+            [:div {:id "port-spectrum" :hx-get "/panel/spectrum" :hx-trigger "refresh-spectrum from:body, every 60s" :hx-swap "innerHTML"}
+             (render-port-spectrum-content username is-admin?)]]
+           [:div {:id "activity-feed" :hx-get "/panel/activity" :hx-trigger "refresh-activity from:body, every 120s" :hx-swap "innerHTML"}
+            (render-activity-content)]]]
 
          [:section.pf-panel {:id "tab-admin" :data-tab-panel "admin" :role "tabpanel" :aria-labelledby "tabbtn-admin" :hidden true}
+          (when is-admin?
+            [:div.pf-host {:id "host-metrics" :hx-get "/panel/host"
+                           :hx-trigger "refresh-host from:body, every 60s" :hx-swap "innerHTML"}
+             (render-host-metrics-content username is-admin?)])
           (when is-admin?
             [:div.pf-segmented {:role "tablist" :aria-label "管理员子导航" :id "admin-subtabs"}
              [:button.pf-segmented-btn {:type "button" :role "tab" :id "subtabbtn-admin-users" :data-subtab "admin-users" :aria-selected "true" :aria-controls "subtab-admin-users" :tabindex "0"} (:admin-panel dash)]
@@ -831,137 +1651,155 @@
           [:div.pf-panel-header
            [:div
             [:h2.pf-panel-title (:forwards t)]
-            [:p.pf-panel-desc (:forwards-desc t)]]
-           [:div.pf-panel-actions
-            [:button.pf-btn.pf-btn-primary {:type "button" :id "btn-open-forward-drawer" :data-action "drawer.open" :data-drawer "forward-drawer"} "+ " (:add-forward btn)]]]
+            [:p.pf-panel-desc (:forwards-desc t)]]]
 
-          (ui.drawer/drawer
-           {:id "forward-drawer"
-            :title (:add-forward btn)
-            :body [:form.pf-drawer-body
-                   {:id "forward-add-form"
-                    :hx-post "/add"
-                    :hx-target "#forward-tbody"
-                    :hx-swap "innerHTML"
-                    :data-reset-on-success "true"
-                    :data-close-drawer-on-success "forward-drawer"}
-                   [:input {:type "hidden" :name "_csrf" :value csrf-token}]
-                   [:div.pf-field
-                    [:label {:for "forward-ip"} [:span.pf-label-text (:label-target-ip fm)]]
-                    [:input.pf-input {:name "ip" :id "forward-ip" :placeholder (:placeholder-ip fm) :required true}]]
-                   [:div.pf-field
-                    [:label {:for "forward-port"} [:span.pf-label-text (:label-source-port fm)]]
-                    [:input.pf-input {:name "port" :id "forward-port" :placeholder (:placeholder-src-port fm) :required true}]
-                    (when (:port-forward-range config)
-                      [:span.pf-field-hint (str "范围: " (get-in config [:port-forward-range :start]) "-" (get-in config [:port-forward-range :end]))])]
-                   [:div.pf-field
-                    [:label {:for "forward-toPort"} [:span.pf-label-text (:label-target-port fm)]]
-                    [:input.pf-input {:name "toPort" :id "forward-toPort" :type "number" :min 1 :max 65535 :placeholder (:placeholder-target-port fm) :required true}]]
-                   [:div.pf-field
-                    [:label {:for "forward-protocol"} [:span.pf-label-text (:label-protocol fm)]]
-                    [:select.pf-select {:name "protocol" :id "forward-protocol" :required true}
-                     [:option {:value "tcp"} "TCP"]
-                     [:option {:value "udp"} "UDP"]]]
-                   [:div.pf-field
-                    [:label {:for "forward-method"} [:span.pf-label-text (:label-method fm)]]
-                    [:select.pf-select {:name "method" :id "forward-method"}
-                     [:option {:value "socat" :selected true} "socat"]
-                     [:option {:value "iptables"} "iptables"]]]
-                   [:div.pf-field
-                    [:label {:for "forward-remark"} [:span.pf-label-text (:label-remark fm)]]
-                    [:input.pf-input {:name "remark" :id "forward-remark" :placeholder (:placeholder-remark fm)}]]
-                   [:button.pf-btn.pf-btn-primary.pf-btn-block {:type "submit" :id "btn-add-forward"} (:add-forward btn)]]})
+          [:div.pf-segmented {:role "tablist" :aria-label "转发子导航" :id "forward-subtabs"}
+           [:button.pf-segmented-btn {:type "button" :role "tab" :id "subtabbtn-forward-port" :data-subtab "forward-port" :aria-selected "true" :aria-controls "subtab-forward-port" :tabindex "0"} "端口转发"]
+           (when show-caddy?
+             [:button.pf-segmented-btn {:type "button" :role "tab" :id "subtabbtn-forward-caddy" :data-subtab "forward-caddy" :aria-selected "false" :aria-controls "subtab-forward-caddy" :tabindex "-1"} "域名反代"])]
 
-          ;; Forwards Table
-          [:div.pf-table-wrap
-           [:table.pf-table.pf-table--zebra
-            [:thead
-             [:tr
-              (when is-admin? [:th (:user-col tbl)])
-              [:th (:source-port tbl)]
-              [:th (:protocol tbl)]
-              [:th (:target-ip tbl)]
-              [:th (:target-port tbl)]
-              [:th (:method tbl)]
-              [:th (:remark tbl)]
-              [:th (:status tbl)]
-              [:th (:actions tbl)]]]
-            [:tbody {:id "forward-tbody" :hx-get "/panel/forwards" :hx-trigger "refresh-forward from:body, every 120s" :hx-swap "innerHTML" :data-loaded "false"}
-             (ui.skeleton/table-rows (if is-admin? 9 8) 3)]]]
-          [:p.pf-footer-note
-           [:b (:footer-socat dash)] "/" [:b (:footer-iptables dash)]
-           (ui.popover/popover
-            {:id "forward-help"
-             :content (list
-                       [:p [:b (:footer-socat dash)] (:footer-socat-desc dash)]
-                       [:p [:b (:footer-iptables dash)] (:footer-iptables-desc dash)]
-                       [:p (:footer-range-help dash) [:code "8080-8085"] (:footer-range-help-desc dash) [:code "80"] (:footer-range-help-mapping dash)])})]]
+          ;; --- 子面板：端口转发 ---
+          [:div {:data-tab-panel-sub "forward-port" :id "subtab-forward-port"}
+           [:div.pf-list-toolbar
+            [:h3.pf-list-toolbar-title "端口转发规则"]
+            [:div.pf-list-toolbar-tools
+             [:label.pf-search
+              (ui.icon/icon :search {:size 14 :class "pf-search-icon"})
+              [:input.pf-input {:type "text" :placeholder "搜索端口、目标、备注…" :data-list-search "forward-tbody"}]]
+             [:div.pf-status-filter {:role "group" :aria-label "状态筛选"}
+              [:button {:type "button" :data-list-filter "forward-tbody" :data-filter "all" :aria-pressed "true"} "全部"]
+              [:button {:type "button" :data-list-filter "forward-tbody" :data-filter "alive" :aria-pressed "false"} "运行中"]
+              [:button {:type "button" :data-list-filter "forward-tbody" :data-filter "dead" :aria-pressed "false"} "异常"]]
+             [:button.pf-btn.pf-btn-primary {:type "button" :id "btn-open-forward-drawer" :data-action "drawer.open" :data-drawer "forward-drawer"}
+              (ui.icon/icon :plus {:size 14}) (:add-forward btn)]]]
 
-         [:section.pf-panel {:id "tab-caddy" :data-tab-panel "caddy" :role "tabpanel" :aria-labelledby "tabbtn-caddy" :hidden true}
-          [:div.pf-panel-header
-           [:div [:h2.pf-panel-title (:caddy t)] [:p.pf-panel-desc (:caddy-desc t)]]
-           (when-not (:ip-mode config)
-             [:div.pf-panel-actions
-              [:button.pf-btn.pf-btn-primary {:type "button" :id "btn-open-caddy-drawer" :data-action "drawer.open" :data-drawer "caddy-drawer"} "+ " (:add-proxy btn)]])]
+           (ui.drawer/drawer
+            {:id "forward-drawer"
+             :title (:add-forward btn)
+             :body [:form.pf-drawer-body
+                    {:id "forward-add-form"
+                     :hx-post "/add"
+                     :hx-target "#forward-tbody"
+                     :hx-swap "innerHTML"
+                     :data-reset-on-success "true"
+                     :data-close-drawer-on-success "forward-drawer"}
+                    [:input {:type "hidden" :name "_csrf" :value csrf-token}]
+                    [:div.pf-field
+                     [:label {:for "forward-ip"} [:span.pf-label-text (:label-target-ip fm)]]
+                     [:input.pf-input {:name "ip" :id "forward-ip" :placeholder (:placeholder-ip fm) :required true}]]
+                    [:div.pf-field
+                     [:label {:for "forward-port"} [:span.pf-label-text (:label-source-port fm)]]
+                     [:input.pf-input {:name "port" :id "forward-port" :placeholder (:placeholder-src-port fm) :required true}]
+                     (when (:port-forward-range config)
+                       [:span.pf-field-hint (str "范围: " (get-in config [:port-forward-range :start]) "-" (get-in config [:port-forward-range :end]))])]
+                    [:div.pf-field
+                     [:label {:for "forward-toPort"} [:span.pf-label-text (:label-target-port fm)]]
+                     [:input.pf-input {:name "toPort" :id "forward-toPort" :type "number" :min 1 :max 65535 :placeholder (:placeholder-target-port fm) :required true}]]
+                    [:div.pf-field
+                     [:label {:for "forward-protocol"} [:span.pf-label-text (:label-protocol fm)]]
+                     [:select.pf-select {:name "protocol" :id "forward-protocol" :required true}
+                      [:option {:value "tcp"} "TCP"]
+                      [:option {:value "udp"} "UDP"]]]
+                    [:div.pf-field
+                     [:label {:for "forward-method"} [:span.pf-label-text (:label-method fm)]]
+                     [:select.pf-select {:name "method" :id "forward-method"}
+                      [:option {:value "socat" :selected true} "socat"]
+                      [:option {:value "iptables"} "iptables"]]]
+                    [:div.pf-field
+                     [:label {:for "forward-remark"} [:span.pf-label-text (:label-remark fm)]]
+                     [:input.pf-input {:name "remark" :id "forward-remark" :placeholder (:placeholder-remark fm)}]]
+                    [:button.pf-btn.pf-btn-primary.pf-btn-block {:type "submit" :id "btn-add-forward"} (:add-forward btn)]]})
 
-          (when-not (:ip-mode config)
-            (ui.drawer/drawer
-             {:id "caddy-drawer"
-              :title (:add-proxy btn)
-              :body [:form.pf-drawer-body
-                     {:id "caddy-add-form"
-                      :hx-post "/caddy/add"
-                      :hx-target "#caddy-tbody"
-                      :hx-swap "innerHTML"
-                      :data-reset-on-success "true"
-                      :data-close-drawer-on-success "caddy-drawer"}
-                     [:input {:type "hidden" :name "_csrf" :value csrf-token}]
-                     [:div.pf-field
-                      [:label {:for "caddy-domain"} [:span.pf-label-text (:label-domain fm)]]
-                      [:select.pf-select {:name "domain" :id "caddy-domain" :required true}
-                       (for [d (:caddy-domains config)]
-                         [:option {:value d :selected (= d (:caddy-domain config))} d])]]
-                     [:div.pf-field
-                      [:label {:for "caddy-worker"} [:span.pf-label-text (:label-worker fm)]]
-                      [:input.pf-input {:name "worker" :id "caddy-worker" :placeholder (:placeholder-worker fm) :required true}]]
-                     [:div.pf-field
-                      [:label {:for "caddy-target"} [:span.pf-label-text (:label-target-addr fm)]]
-                      [:input.pf-input {:name "target" :id "caddy-target" :placeholder (:placeholder-target-addr fm) :required true}]]
-                     [:div.pf-field
-                      [:label {:for "caddy-remark"} [:span.pf-label-text (:label-remark fm)]]
-                      [:input.pf-input {:name "remark" :id "caddy-remark" :placeholder (:placeholder-remark fm)}]]
-                     [:button.pf-btn.pf-btn-primary.pf-btn-block {:type "submit" :id "btn-add-caddy"} (:add-proxy btn)]]}))
+           [:div.pf-table-wrap
+            [:table.pf-table.pf-table--zebra
+             [:thead
+              [:tr
+               [:th (:resource-name tbl)]
+               [:th (:ingress tbl)]
+               [:th (:engine tbl)]
+               [:th (:internal-target tbl)]
+               [:th (:protocol tbl)]
+               [:th (:latency-runtime tbl)]
+               [:th (:status tbl)]
+               [:th (:owner tbl)]
+               [:th (:actions tbl)]]]
+             [:tbody {:id "forward-tbody" :hx-get "/panel/forwards" :hx-trigger "refresh-forward from:body, every 120s" :hx-swap "innerHTML" :data-loaded "false"}
+              (ui.skeleton/table-rows 9 3)]]]
+           [:p.pf-footer-note
+            [:b (:footer-socat dash)] "/" [:b (:footer-iptables dash)]
+            (ui.popover/popover
+             {:id "forward-help"
+              :content (list
+                        [:p [:b (:footer-socat dash)] (:footer-socat-desc dash)]
+                        [:p [:b (:footer-iptables dash)] (:footer-iptables-desc dash)]
+                        [:p (:footer-range-help dash) [:code "8080-8085"] (:footer-range-help-desc dash) [:code "80"] (:footer-range-help-mapping dash)])})]]
 
-          ;; Caddy reverse proxy Card (hidden in IP mode)
-          (when-not (:ip-mode config)
-            [:div.pf-card
-             [:div.pf-card-body
-              [:div.pf-card-title (:caddy-title dash)]
+          ;; --- 子面板：域名反代（合并进转发 Tab） ---
+          (when show-caddy?
+            [:div {:data-tab-panel-sub "forward-caddy" :id "subtab-forward-caddy" :hidden true}
+             [:div.pf-list-toolbar
+              [:h3.pf-list-toolbar-title "域名反向代理"]
+              [:div.pf-list-toolbar-tools
+               [:label.pf-search
+                (ui.icon/icon :search {:size 14 :class "pf-search-icon"})
+                [:input.pf-input {:type "text" :placeholder "搜索域名、目标、备注…" :data-list-search "caddy-tbody"}]]
+               [:div.pf-status-filter {:role "group" :aria-label "状态筛选"}
+                [:button {:type "button" :data-list-filter "caddy-tbody" :data-filter "all" :aria-pressed "true"} "全部"]
+                [:button {:type "button" :data-list-filter "caddy-tbody" :data-filter "alive" :aria-pressed "false"} "运行中"]
+                [:button {:type "button" :data-list-filter "caddy-tbody" :data-filter "disabled" :aria-pressed "false"} "已停用"]]
+               [:button.pf-btn.pf-btn-primary {:type "button" :id "btn-open-caddy-drawer" :data-action "drawer.open" :data-drawer "caddy-drawer"}
+                (ui.icon/icon :plus {:size 14}) (:add-proxy btn)]]]
 
-              (when-not (caddy/available?)
-                [:div.pf-alert {:role "alert"}
-                 [:svg.pf-alert-icon {:xmlns "http://www.w3.org/2000/svg" :fill "none" :viewBox "0 0 24 24" :stroke "currentColor"}
-                  [:path {:stroke-linecap "round" :stroke-linejoin "round" :stroke-width "2" :d "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"}]]
-                 [:span [:strong (:caddy-unavailable dash)] (:caddy-install-hint dash)]])
+             (ui.drawer/drawer
+              {:id "caddy-drawer"
+               :title (:add-proxy btn)
+               :body [:form.pf-drawer-body
+                      {:id "caddy-add-form"
+                       :hx-post "/caddy/add"
+                       :hx-target "#caddy-tbody"
+                       :hx-swap "innerHTML"
+                       :data-reset-on-success "true"
+                       :data-close-drawer-on-success "caddy-drawer"}
+                      [:input {:type "hidden" :name "_csrf" :value csrf-token}]
+                      [:div.pf-field
+                       [:label {:for "caddy-domain"} [:span.pf-label-text (:label-domain fm)]]
+                       [:select.pf-select {:name "domain" :id "caddy-domain" :required true}
+                        (for [d (:caddy-domains config)]
+                          [:option {:value d :selected (= d (:caddy-domain config))} d])]]
+                      [:div.pf-field
+                       [:label {:for "caddy-worker"} [:span.pf-label-text (:label-worker fm)]]
+                       [:input.pf-input {:name "worker" :id "caddy-worker" :placeholder (:placeholder-worker fm) :required true}]]
+                      [:div.pf-field
+                       [:label {:for "caddy-target"} [:span.pf-label-text (:label-target-addr fm)]]
+                       [:input.pf-input {:name "target" :id "caddy-target" :placeholder (:placeholder-target-addr fm) :required true}]]
+                      [:div.pf-field
+                       [:label {:for "caddy-remark"} [:span.pf-label-text (:label-remark fm)]]
+                       [:input.pf-input {:name "remark" :id "caddy-remark" :placeholder (:placeholder-remark fm)}]]
+                      [:button.pf-btn.pf-btn-primary.pf-btn-block {:type "submit" :id "btn-add-caddy"} (:add-proxy btn)]]})
 
-            ;; Caddy Table
-              [:div.pf-table-wrap
-               [:table.pf-table.pf-table--zebra
-                [:thead
-                 [:tr
-                  (when is-admin? [:th (:user-col tbl)])
-                  [:th (:domain tbl)]
-                  [:th (:worker tbl)]
-                  [:th (:full-domain tbl)]
-                  [:th (:target-addr tbl)]
-                  [:th (:remark tbl)]
-                  [:th (:status tbl)]
-                  [:th (:actions tbl)]]]
-                [:tbody {:id "caddy-tbody" :hx-get "/panel/caddy" :hx-trigger "refresh-caddy from:body, every 120s" :hx-swap "innerHTML" :data-loaded "false"}
-                 (ui.skeleton/table-rows (if is-admin? 8 7) 3)]]]
-              [:p.pf-footer-note
-               [:b (:footer-caddy dash)]
-               (ui.popover/popover {:id "caddy-help" :content [:p [:b (:footer-caddy dash)] (:footer-caddy-desc dash)]})]]])]
+             (when-not (caddy/available?)
+               [:div.pf-alert {:role "alert"}
+                (ui.icon/icon :alert-triangle {:size 18 :class "pf-alert-icon"})
+                [:span [:strong (:caddy-unavailable dash)] (:caddy-install-hint dash)]])
+
+             [:div.pf-table-wrap
+              [:table.pf-table.pf-table--zebra
+               [:thead
+                [:tr
+                 [:th (:resource-name tbl)]
+                 [:th (:ingress tbl)]
+                 [:th (:engine tbl)]
+                 [:th (:internal-target tbl)]
+                 [:th (:protocol tbl)]
+                 [:th (:latency-runtime tbl)]
+                 [:th (:status tbl)]
+                 [:th (:owner tbl)]
+                 [:th (:actions tbl)]]]
+               [:tbody {:id "caddy-tbody" :hx-get "/panel/caddy" :hx-trigger "refresh-caddy from:body, every 120s" :hx-swap "innerHTML" :data-loaded "false"}
+                (ui.skeleton/table-rows 9 3)]]]
+             [:p.pf-footer-note
+              [:b (:footer-caddy dash)]
+              (ui.popover/popover {:id "caddy-help" :content [:p [:b (:footer-caddy dash)] (:footer-caddy-desc dash)]})]])]
 
          [:section.pf-panel {:id "tab-docker" :data-tab-panel "docker" :role "tabpanel" :aria-labelledby "tabbtn-docker" :hidden true}
           [:div.pf-panel-header
@@ -1085,7 +1923,7 @@
 
                      ;; Advanced options
                      [:details
-                      [:summary.pf-text-muted "⚙️ 高级选项"]
+                      [:summary.pf-text-muted "高级选项"]
                       [:div.pf-inset-panel
                        [:label.pf-checkbox-label
                         [:input.pf-checkbox {:type "checkbox" :name "netEnabled" :id "smolvm-net" :value "on"}]
@@ -1119,9 +1957,165 @@
                (:smolvm-port-change-warning dash)]]])]]
 
         ;; Password Modal Container
-        [:div {:id "password-modal-container"}]]
+        [:div {:id "password-modal-container"}]
+
+        ;; 命令面板注册表与覆盖层（默认隐藏，纯增强）
+        (render-command-registry is-admin?)
+        (render-command-palette)]
 
         ;; Log viewer opens as popup window — no modal needed
 
        [:script {:src (core/asset-url "main.js")}]
-       [:script {:src (core/asset-url "tabs.js")}]]])))
+       [:script {:src (core/asset-url "tabs.js")}]
+       [:script {:src (core/asset-url "console.js")}]]])))
+
+;; ============================================================
+;; Kiosk 大屏（GET /wall）
+;; 只读监看页：无一级导航/Drawer/命令面板/编辑入口；复用 P1 的接线 lane 与状态色。
+;; ============================================================
+
+(defn- wall-kpi [label value unit sub variant]
+  [:div.pf-kiosk-kpi {:class variant}
+   [:div.pf-kiosk-kpi-label label]
+   [:div.pf-kiosk-kpi-value (str value) [:span.pf-kiosk-kpi-unit unit]]
+   [:div.pf-kiosk-kpi-sub sub]])
+
+(defn render-wall-kpis-content
+  "大屏 KPI 卡内部内容。全部为真实指标，不造吞吐/事件数等无数据来源的数字。"
+  [username is-admin?]
+  (let [resources (vec (all-resources username is-admin?))
+        alive (count (filter #(= :alive (:status %)) resources))
+        abnormal (count (filter #(#{:dead :unknown} (:status %)) resources))
+        forwards (filter #(= :forward (:type %)) resources)
+        containers (count (filter #(= :container (:type %)) resources))
+        machines (count (filter #(= :vm (:type %)) resources))]
+    (h/html
+     [:div.pf-kiosk-kpis
+      (wall-kpi "在线资源" alive "个实例" (str "共 " (count resources) " 个资源") "pf-kiosk-kpi--ok")
+      (wall-kpi "异常资源" abnormal "处告警" (if (pos? abnormal) "需要人工关注" "核心链路健康") "pf-kiosk-kpi--danger")
+      (wall-kpi "端口转发" (count forwards) "条规则"
+                (str "运行中 " (count (filter #(= :alive (:status %)) forwards)) " 条") "")
+      (wall-kpi "容器 / 微虚机" (+ containers machines) "个实例"
+                (str "容器 " containers " · 微虚机 " machines) "")])))
+
+(defn- wall-topo-row [r]
+  (let [status (:status r)
+        stroke (get status-colors status "#D9A441")]
+    [:div.pf-kiosk-topo-row
+     {:data-resource-key (:key r)}
+     [:div.pf-kiosk-topo-ingress
+      [:span.pf-kiosk-topo-ingress-value (:ingress r)]
+      [:span.pf-kiosk-topo-name (:name r)]]
+     (topo-connector status)
+     [:div.pf-kiosk-topo-engine
+      [:div.pf-kiosk-topo-engine-chip {:data-status (name status)}
+       [:span.pf-topo-dot {:style (str "background:" stroke)}]
+       [:span (:engine r)]
+       [:span.pf-topo-proto (:protocol r)]]]
+     (topo-connector status)
+     [:div.pf-kiosk-topo-target
+      [:span.pf-kiosk-topo-target-main (:target r)]
+      [:span.pf-kiosk-topo-target-lat (latency-text r)]]]))
+
+(defn render-wall-topology-content
+  "大屏系统接线概览内部内容：取前 4 条资源，复用 P1 的 lane 渲染，只读不可点。"
+  [username is-admin?]
+  (let [shown (vec (take 4 (all-resources username is-admin?)))]
+    (h/html
+     [:div.pf-kiosk-panel-head
+      [:h2.pf-kiosk-panel-title
+       (ui.icon/icon :activity {:size 18})
+       "系统接线概览"]
+      [:span.pf-kiosk-panel-note "远距离展示 · 实时连通性探测"]]
+     (if (empty? shown)
+       [:div.pf-kiosk-empty "暂无资源"]
+       [:div.pf-kiosk-topo-rows (for [r shown] (wall-topo-row r))]))))
+
+(defn- wall-alert-severity [r]
+  (if (= :dead (:status r)) :error :warning))
+
+(defn- wall-alert [r]
+  (let [sev (wall-alert-severity r)]
+    [:div.pf-kiosk-alert {:class (if (= sev :error) "pf-kiosk-alert--error" "pf-kiosk-alert--warning")
+                          :data-resource-key (:key r)}
+     [:div.pf-kiosk-alert-head
+      [:span.pf-kiosk-alert-title (str (:type-label r) "异常")]
+      [:span.pf-kiosk-alert-sev (if (= sev :error) "异常" "未知")]]
+     [:div.pf-kiosk-alert-line (str (:ingress r) " → " (:target r))]
+     [:div.pf-kiosk-alert-desc (if (= sev :error)
+                                 "连接不可达或进程未运行"
+                                 "无法判定状态，等待探针或人工确认")]
+     [:div.pf-kiosk-alert-foot
+      [:span (str "负责人 " (:owner r))]
+      [:span (str "引擎 " (:engine r))]]]))
+
+(defn render-wall-alerts-content
+  "大屏异常告警内部内容：由四域状态计算 dead/unknown，dead 优先；
+   并复用活动记录渲染展示最近的失败/自愈事件（飞行记录仪）。"
+  [username is-admin?]
+  (let [alerts (->> (all-resources username is-admin?)
+                    (filter #(#{:dead :unknown} (:status %)))
+                    (sort-by (comp {:dead 0 :unknown 1} :status))
+                    vec)
+        activity-events (->> (activity/recent 60)
+                             (filter #(#{:warning :error} (:severity %)))
+                             (take 5)
+                             vec)]
+    (h/html
+     [:div.pf-kiosk-panel-head
+      [:h2.pf-kiosk-panel-title.pf-kiosk-panel-title--danger
+       (ui.icon/icon :alert-triangle {:size 18})
+       "异常告警"]
+      [:span.pf-kiosk-badge-danger (str (count alerts) " 处")]]
+     (if (empty? alerts)
+       [:div.pf-kiosk-empty "当前无异常，核心链路健康"]
+       [:div.pf-kiosk-alerts (for [r alerts] (wall-alert r))])
+     (when (seq activity-events)
+       (list
+        [:div.pf-kiosk-activity-head "自愈与失败事件"]
+        [:div.pf-activity-list (render-activity-items activity-events)])))))
+
+(defn render-wall [req]
+  (let [user (:user req)
+        username (:username user)
+        is-admin? (= (:role user) "admin")
+        csrf-token (core/csrf-generate)]
+    (core/html-response
+     [:html {:lang (:html-lang (:app i18n/strings)) :data-theme "dark"}
+      [:head
+       [:meta {:charset "utf-8"}]
+       [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
+       [:meta {:name "csrf-token" :content csrf-token}]
+       [:title "Culvert 监控大屏"]
+       [:link {:href (core/asset-url "app.css") :rel "stylesheet"}]
+       [:script {:src "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"}]]
+      [:body {:hx-headers (json/generate-string {"X-CSRF-Token" csrf-token})}
+       [:div.pf-kiosk
+        [:header.pf-kiosk-head
+         [:div.pf-kiosk-brand
+          [:span.pf-live-dot]
+          [:div
+           [:h1.pf-kiosk-title "CULVERT MONITOR"]
+           [:p.pf-kiosk-subtitle "NETWORK TOPOLOGY & STATUS OPS CENTER"]]]
+         [:div.pf-kiosk-status
+          [:span.pf-ws-indicator {:id "wall-ws-indicator" :data-ws-indicator true :data-state "connecting" :title "实时数据流"}]
+          [:span.pf-kiosk-status-text "实时数据流"]
+          [:div.pf-kiosk-clock
+           [:div.pf-kiosk-time {:id "wall-clock"} "--:--:--"]
+           [:div.pf-kiosk-date {:id "wall-date"} ""]]
+          [:a.pf-kiosk-exit {:href "/"}
+           (ui.icon/icon :arrow-right-left {:size 14})
+           "返回控制台"]]]
+        [:main.pf-kiosk-main
+         [:div {:id "wall-kpis" :hx-get "/panel/wall-kpis"
+                :hx-trigger "refresh-wall-kpis from:body, every 30s" :hx-swap "innerHTML"}
+          (render-wall-kpis-content username is-admin?)]
+         [:div.pf-kiosk-grid
+          [:div.pf-kiosk-panel {:id "wall-topology" :hx-get "/panel/wall-topology"
+                                :hx-trigger "refresh-wall-topology from:body, every 30s" :hx-swap "innerHTML"}
+           (render-wall-topology-content username is-admin?)]
+          [:div.pf-kiosk-panel {:id "wall-alerts" :hx-get "/panel/wall-alerts"
+                                :hx-trigger "refresh-wall-alerts from:body, every 15s" :hx-swap "innerHTML"}
+           (render-wall-alerts-content username is-admin?)]]]]
+       [:script {:src (core/asset-url "main.js")}]
+       [:script {:src (core/asset-url "console.js")}]]])))

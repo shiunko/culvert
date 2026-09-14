@@ -1,6 +1,6 @@
 document.addEventListener("DOMContentLoaded", () => {
   var __i18n = {
-    copied: "已复制 ✓",
+    copied: "已复制",
     copyFailed: "复制失败，请手动复制",
     networkError: "网络错误",
     cannotGetPwd: "无法获取密码",
@@ -73,14 +73,16 @@ document.addEventListener("DOMContentLoaded", () => {
     "smolvm-tbody": "refresh-smolvm",
     "quota-bar": "refresh-quota",
     "overview-stats": "refresh-overview",
+    "topology-view": "refresh-topology",
+    "port-spectrum": "refresh-spectrum",
+    "activity-feed": "refresh-activity",
+    "host-metrics": "refresh-host",
     "admin-users-tbody": "refresh-admin",
     "admin-containers-tbody": "refresh-admin-containers",
+    "wall-kpis": "refresh-wall-kpis",
+    "wall-topology": "refresh-wall-topology",
+    "wall-alerts": "refresh-wall-alerts",
   };
-
-  function getWsToken() {
-    var meta = document.querySelector('meta[name="ws-token"]');
-    return meta ? meta.getAttribute("content") : "";
-  }
 
   function getCsrfToken() {
     var meta = document.querySelector('meta[name="csrf-token"]');
@@ -115,13 +117,38 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  function connectWebSocket() {
+  function scheduleWsReconnect() {
+    console.log("[ws] " + wsReconnectDelay / 1000 + "s 后重连...");
+    document.body.dispatchEvent(new CustomEvent("ws-status", {detail: {state: "reconnecting"}}));
+    setTimeout(connectWebSocket, wsReconnectDelay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+  }
+
+  // 先用带 CSRF 的 POST /ws/ticket 换取一次性票据（30 秒有效），再用它升级 WebSocket；
+  // 不再使用页面内预写的长期 token（见 src/culvert/web/AGENTS.md 与 server.clj 的 /ws 分流）。
+  function fetchWsTicket() {
+    var csrf = getCsrfToken();
+    return fetch("/ws/ticket", {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded", "X-CSRF-Token": csrf},
+      body: "_csrf=" + encodeURIComponent(csrf),
+      credentials: "same-origin",
+    }).then(function (res) {
+      if (!res.ok) {
+        throw new Error("票据请求失败");
+      }
+      return res.json();
+    }).then(function (data) {
+      if (!data.ticket) {
+        throw new Error("票据响应为空");
+      }
+      return data.ticket;
+    });
+  }
+
+  function openWebSocket(ticket) {
     var protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    var token = getWsToken();
-    var wsUrl = protocol + "//" + window.location.host + "/ws";
-    if (token) {
-      wsUrl += "?token=" + encodeURIComponent(token);
-    }
+    var wsUrl = protocol + "//" + window.location.host + "/ws?ticket=" + encodeURIComponent(ticket);
 
     try {
       var ws = new WebSocket(wsUrl);
@@ -156,20 +183,19 @@ document.addEventListener("DOMContentLoaded", () => {
       };
 
       ws.onclose = function () {
-        console.log("[ws] 连接已断开，" + wsReconnectDelay / 1000 + "s 后重连...");
-        document.body.dispatchEvent(new CustomEvent("ws-status", {detail: {state: "reconnecting"}}));
-        setTimeout(connectWebSocket, wsReconnectDelay);
-        wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+        scheduleWsReconnect();
       };
 
       ws.onerror = function () {
         // onclose will fire after this, triggering reconnect
       };
     } catch (e) {
-      console.warn("[ws] 连接失败，" + wsReconnectDelay / 1000 + "s 后重试");
-      setTimeout(connectWebSocket, wsReconnectDelay);
-      wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+      scheduleWsReconnect();
     }
+  }
+
+  function connectWebSocket() {
+    fetchWsTicket().then(openWebSocket, scheduleWsReconnect);
   }
 
   connectWebSocket();
@@ -359,14 +385,14 @@ document.addEventListener("DOMContentLoaded", () => {
             .then(function (password) {
               input.type = "text";
               input.value = password;
-              togglePassBtn.textContent = "👁️‍🗨️";
+              togglePassBtn.textContent = __i18n.hidePassword;
               togglePassBtn.title = __i18n.hidePassword;
             })
             .catch(() => showToast(__i18n.cannotGetPwd, "error"));
         } else {
           input.type = "password";
           input.value = "●●●●●●●●●●●●";
-          togglePassBtn.textContent = "👁";
+          togglePassBtn.textContent = __i18n.showPassword;
           togglePassBtn.title = __i18n.showPassword;
         }
       }

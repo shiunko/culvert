@@ -119,35 +119,40 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // ============================================================
-  // 管理员 Tab 内二级 Segmented Control：仅在 #admin-subtabs 作用域内生效，不写 URL，与一级 Tab 独立。
+  // 作用域限定的二级 Segmented Control（#admin-subtabs、#forward-subtabs）。
+  // 以最近的 [data-tab-panel] 容器为作用域，避免多组二级导航互相串扰（旧实现全局查询会串），
+  // 不写 URL，与一级 Tab 完全独立。
   // ============================================================
-  var adminSubtabs = document.getElementById("admin-subtabs");
-  if (adminSubtabs) {
-    var activateSubtab = (function () {
-      return function (subtabId) {
-        Array.prototype.slice.call(adminSubtabs.querySelectorAll("[data-subtab]")).forEach(function (btn) {
-          var isActive = btn.getAttribute("data-subtab") === subtabId;
-          btn.setAttribute("aria-selected", isActive ? "true" : "false");
-          btn.setAttribute("tabindex", isActive ? "0" : "-1");
-        });
-        document.querySelectorAll("[data-tab-panel-sub]").forEach(function (panel) {
-          panel.hidden = panel.getAttribute("data-tab-panel-sub") !== subtabId;
-        });
-      };
-    })();
+  function setupScopedTabs(containerId) {
+    var container = document.getElementById(containerId);
+    if (!container) {
+      return;
+    }
+    var scope = container.closest("[data-tab-panel]") || document;
 
-    adminSubtabs.addEventListener("click", function (e) {
+    function activate(subtabId) {
+      Array.prototype.slice.call(container.querySelectorAll("[data-subtab]")).forEach(function (btn) {
+        var isActive = btn.getAttribute("data-subtab") === subtabId;
+        btn.setAttribute("aria-selected", isActive ? "true" : "false");
+        btn.setAttribute("tabindex", isActive ? "0" : "-1");
+      });
+      scope.querySelectorAll("[data-tab-panel-sub]").forEach(function (panel) {
+        panel.hidden = panel.getAttribute("data-tab-panel-sub") !== subtabId;
+      });
+    }
+
+    container.addEventListener("click", function (e) {
       var btn = e.target.closest("[data-subtab]");
       if (btn) {
-        activateSubtab(btn.getAttribute("data-subtab"));
+        activate(btn.getAttribute("data-subtab"));
       }
     });
 
-    adminSubtabs.addEventListener("keydown", function (e) {
+    container.addEventListener("keydown", function (e) {
       if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") {
         return;
       }
-      var subButtons = Array.prototype.slice.call(adminSubtabs.querySelectorAll("[data-subtab]"));
+      var subButtons = Array.prototype.slice.call(container.querySelectorAll("[data-subtab]"));
       var currentIndex = subButtons.findIndex(function (b) { return b.getAttribute("aria-selected") === "true"; });
       if (currentIndex === -1) {
         return;
@@ -155,11 +160,14 @@ document.addEventListener("DOMContentLoaded", () => {
       var delta = e.key === "ArrowRight" ? 1 : -1;
       var nextIndex = (currentIndex + delta + subButtons.length) % subButtons.length;
       var nextBtn = subButtons[nextIndex];
-      activateSubtab(nextBtn.getAttribute("data-subtab"));
+      activate(nextBtn.getAttribute("data-subtab"));
       nextBtn.focus();
       e.preventDefault();
     });
   }
+
+  setupScopedTabs("admin-subtabs");
+  setupScopedTabs("forward-subtabs");
 
   // ============================================================
   // Drawer：创建表单弹出层

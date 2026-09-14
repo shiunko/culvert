@@ -38,6 +38,9 @@
 (s/def ::smolvmDefaultCpu string?)
 (s/def ::smolvmDefaultMem string?)
 (s/def ::smolvmPortRange map?)
+(s/def ::probeEnabled boolean?)
+(s/def ::probeIntervalMs pos-int?)
+(s/def ::probeTimeoutMs pos-int?)
 
 (s/def ::config-raw
   (s/keys :req-un [::port ::publicIp]
@@ -48,7 +51,8 @@
                    ::dockerMutationsEnabled ::smolvmMutationsEnabled ::containerCliPath
                    ::ttydPortRange ::ttydMaxClients ::portForwardRange ::defaultQuota ::s3
                    ::smolvmPath ::smolvmDefaultShell ::smolvmDefaultCpu
-                   ::smolvmDefaultMem ::smolvmPortRange]))
+                   ::smolvmDefaultMem ::smolvmPortRange
+                   ::probeEnabled ::probeIntervalMs ::probeTimeoutMs]))
 
 (def ^:private default-raw-config
   {:port 10092
@@ -205,7 +209,10 @@
       :smolvm-db-path (:smolvm-db-path paths)
       :smolvm-images-config smolvm-images
       :smolvm-images-map smolvm-images-map
-      :smolvm-allowed-images (vec (distinct (map :name smolvm-images)))})))
+      :smolvm-allowed-images (vec (distinct (map :name smolvm-images)))
+      :probe-enabled? (not (false? (:probeEnabled raw)))
+      :probe-interval-ms (let [v (:probeIntervalMs raw)] (if (nil? v) 15000 (int v)))
+      :probe-timeout-ms (let [v (:probeTimeoutMs raw)] (if (nil? v) 300 (int v)))})))
 
 (defn- executable? [path]
   (let [file (io/file path)]

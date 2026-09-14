@@ -353,6 +353,10 @@ public/app/
 
 无。第 14 节列举的全部事项（14.1、14.1-b、14.2、14.3、14.4、14.5、14.6、14.7、14.8、14.9）均已完成。
 
+### 后续阶段（docs/13）：前端原型对齐
+
+本文的“防丑”目标已达成，但尚未对齐美术原型。后续按 `docs/13-前端原型对齐与落地计划.md` 分 P1–P4 推进：P1（青蓝主题重置 + 资源接线图 + 端口频谱 + 合并转发 Tab + TCP 延迟探针）、P2（⌘K 命令面板）、P3（Kiosk 大屏 `/wall`）、P4（活动记录）与管理页主机指标均已完成，分别见 `docs/13-1`～`docs/13-5` 的「实施记录」。P1 的 OOB 策略从 `hx-swap-oob="true"` 改为 `innerHTML`（见 13-1）；P3 顺带修复了 `main.js` 未按 ticket 流程连 WebSocket 的历史缺陷（见 13-3）；P4 的活动记录接入 `observability/activity`（见 13-4）；P5 新增 `observability/host`（见 13-5）；`src/culvert/web/AGENTS.md` 已同步。
+
 ### 验证证据
 
 - `bb check`、`bb fmt-check` 通过；

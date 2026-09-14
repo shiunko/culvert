@@ -7,6 +7,8 @@
             [culvert.docker :as docker]
             [culvert.forward :as forward]
             [culvert.i18n :as i18n]
+            [culvert.observability.activity :as activity]
+            [culvert.smolvm.manager :as smolvm]
             [culvert.web.core :as web]
             [culvert.web.handlers :as handlers]
             [culvert.web.views :as views]))
@@ -427,3 +429,98 @@
       (swap! auth/token-store assoc-in [token :expires] (- (System/currentTimeMillis) 1000))
       (is (nil? (auth/validate-token token)))
       (is (nil? (get @auth/token-store token))))))
+
+;; ============================================================
+;; Kiosk 大屏：只读且与 / 相同的认证边界
+;; ============================================================
+
+(deftest wall-is-read-only-and-authenticated
+  (testing "未认证被拒绝"
+    (is (= 401
+           (:status (handlers/route-dispatcher {:request-method :get :uri "/wall"})))))
+  (testing "已认证返回只读大屏，不含任何 mutation 入口"
+    (with-redefs [auth/authenticate (fn [_ _] {:username "alice"
+                                               :session-id "basic:alice:1"
+                                               :role "user"
+                                               :quotas {}})]
+      (let [response (handlers/route-dispatcher
+                      {:request-method :get
+                       :uri "/wall"
+                       :headers {"authorization" (basic-authorization "alice" "secret")}})
+            body (:body response)]
+        (is (= 200 (:status response)))
+        (is (str/includes? body "CULVERT MONITOR"))
+        (is (str/includes? body "wall-clock"))
+        (is (not (str/includes? body "hx-post")))
+        (is (not (str/includes? body "command-palette")))
+        (is (not (str/includes? body "app-tabs")))))))
+
+;; ============================================================
+;; 活动记录：mutation 成功后写入事件（P4）
+;; ============================================================
+
+(deftest successful-mutation-records-activity
+  (activity/clear!)
+  (with-redefs [auth/authenticate (fn [_ _] {:username "alice"
+                                             :session-id "basic:alice:1"
+                                             :role "user"
+                                             :quotas {}})
+                web/csrf-validate (fn [& _] true)
+                forward/get-entries (fn [& _] [])
+                forward/add-forward! (fn [& _] nil)]
+    (handlers/route-dispatcher
+     {:request-method :post
+      :uri "/add"
+      :headers {"authorization" (basic-authorization "alice" "secret")}
+      :body "ip=10.0.0.5&port=8080&toPort=80&protocol=tcp&method=socat&_csrf=t"})
+    (let [event (first (activity/recent 1))]
+      (is (= :forward/add (:action event)))
+      (is (= :success (:outcome event)))
+      (is (= :info (:severity event)))
+      (is (= "alice" (:actor event)))
+      (is (= "fwd-8080-tcp-socat" (get-in event [:resource :key])))))
+  (activity/clear!))
+
+;; ============================================================
+;; 管理页主机指标：端口池聚合（P5）
+;; ============================================================
+
+(deftest port-pool-usage-aggregates-real-ports
+  (with-redefs [forward/get-entries (fn [& _] [{:isRange false}
+                                               {:isRange true :fromPort 10000 :toRangePort 10009}])
+                docker/get-containers (fn [& _] [{:ports {"8080" {:enabled true}
+                                                          "8081" {:enabled false}}}])
+                smolvm/get-machines (fn [& _] [{:ports {"9000" {:enabled true}}}])]
+    (let [usage (views/port-pool-usage "admin" true)]
+      (testing "占用 = 1 单端口 + 10 范围 + 1 已启用容器端口 + 1 已启用微虚机端口"
+        (is (= 13 (:used usage))))
+      (is (pos? (:total usage)))
+      (is (number? (:used-pct usage))))))
+
+;; ============================================================
+;; 管理页主机指标：/panel/host 仅管理员（P5）
+;; ============================================================
+
+(deftest host-panel-is-admin-only
+  (testing "普通用户被拒绝"
+    (with-redefs [auth/authenticate (fn [_ _] {:username "alice"
+                                               :session-id "basic:alice:1"
+                                               :role "user"
+                                               :quotas {}})]
+      (is (= 403
+             (:status (handlers/route-dispatcher
+                       {:request-method :get
+                        :uri "/panel/host"
+                        :headers {"authorization" (basic-authorization "alice" "secret")}}))))))
+  (testing "管理员返回主机指标卡"
+    (with-redefs [auth/authenticate (fn [_ _] {:username "admin"
+                                               :session-id "basic:admin:1"
+                                               :role "admin"
+                                               :quotas {}})]
+      (let [response (handlers/route-dispatcher
+                      {:request-method :get
+                       :uri "/panel/host"
+                       :headers {"authorization" (basic-authorization "admin" "secret")}})]
+        (is (= 200 (:status response)))
+        (is (str/includes? (:body response) "pf-host"))
+        (is (str/includes? (:body response) "端口池"))))))

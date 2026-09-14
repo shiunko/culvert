@@ -45,7 +45,7 @@
 | 符号 | 类型 | 位置 | 作用 |
 |---|---|---|---|
 | `culvert.main/-main` | 入口函数 | `src/culvert/main.clj` | 注册关闭钩子并启动系统 |
-| `system/default-dependencies` | 组合配置 | `src/culvert/system.clj` | 声明十个组件及启动顺序 |
+| `system/default-dependencies` | 组合配置 | `src/culvert/system.clj` | 声明十二个组件及启动顺序（含 TCP 延迟探针） |
 | `system/start!`、`system/stop!` | 生命周期 | `src/culvert/system.clj` | 顺序启动、失败回滚、逆序停止 |
 | `web.handlers/route-dispatcher` | HTTP 路由 | `src/culvert/web/handlers.clj` | 所有 HTTP 业务入口和健康检查 |
 | `web.server/start-server!` | 传输入口 | `src/culvert/web/server.clj` | 组合 HTTP 中间件和 WebSocket 升级 |

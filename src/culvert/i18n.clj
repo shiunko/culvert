@@ -20,23 +20,23 @@
 
    ;; -------------------------------------------------------- ;; :dashboard — Page sections & banners ;; --------------------------------------------------------
    :dashboard
-   {:ip-mode-title "📡 IP 直连模式"
+   {:ip-mode-title "IP 直连模式"
     :ip-mode-desc "— Caddy 反向代理已禁用，所有访问通过 IP:PORT 直连"
     :user-badge-admin "管理员"
     :user-badge-user "用户"
     :admin-badge "admin"
     :created-at-hyphen "—"
 
-    :admin-panel "🛡️ 管理员面板"
-    :admin-container-panel "🖥️ 主机容器分配"
+    :admin-panel "管理员面板"
+    :admin-container-panel "主机容器分配"
     :admin-container-desc "查看主机上所有容器。分配给用户后，用户可在「容器管理」面板中操作。"
     :admin-container-summary #(str "共 " (:total %) " 个容器 · " (:assigned %) " 个已分配 · " (:unassigned %) " 个待分配")
-    :port-forward "🔀 端口转发管理器"
-    :caddy-title "🌐 Caddy 反向代理"
-    :caddy-unavailable "⚠️ Caddy 未安装或不可用。"
+    :port-forward "端口转发管理器"
+    :caddy-title "Caddy 反向代理"
+    :caddy-unavailable "Caddy 未安装或不可用。"
     :caddy-install-hint "请安装 Caddy 后重启服务"
-    :docker-title "🐳 容器管理 "
-    :docker-unavailable #(str "⚠️ 容器运行时 " (:container-cli %) " 不可用。")
+    :docker-title "容器管理 "
+    :docker-unavailable #(str "容器运行时 " (:container-cli %) " 不可用。")
     :docker-install-hint "请安装并运行容器服务。"
 
     :footer-socat "socat"
@@ -52,23 +52,23 @@
     :container-rm-mode "容器以 "
     :container-rm-mode-desc " 模式运行，删除即销毁。通过 "
     :container-rm-mode-desc2 " 保持运行，使用 ttyd 远程终端连接。"
-    :container-logs-title "📄 容器日志"
-    :container-logs-refresh "🔄 刷新"
-    :container-logs-close "✖ 关闭"
+    :container-logs-title "容器日志"
+    :container-logs-refresh "刷新"
+    :container-logs-close "关闭"
     :container-logs-empty "暂无日志输出"
     :container-logs-error "获取日志失败"
     :container-unassigned "未分配"
-    :s3-mount-label "⚙️ 挂载 S3 存储"
-    :s3-mount-desc "☁️ S3 数据挂载 — 容器创建后将 S3 兼容存储挂载到 "
+    :s3-mount-label "挂载 S3 存储"
+    :s3-mount-desc "S3 数据挂载 — 容器创建后将 S3 兼容存储挂载到 "
     :s3-endpoint-default "留空使用 AWS S3 默认"
     :s3-region-optional "可选"
-    :s3-test-btn "🔍 测试"
+    :s3-test-btn "测试"
 
-    :smolvm-title "🖥️ MicroVM 管理"
-    :smolvm-unavailable "⚠️ smolvm 未安装或不可用。"
+    :smolvm-title "MicroVM 管理"
+    :smolvm-unavailable "smolvm 未安装或不可用。"
     :smolvm-install-hint "请安装 smolvm 后重启服务。"
     :smolvm-mode-desc "VM 使用 machine create（持久化），通过 start/stop 管理，ttyd 远程终端连接。"
-    :smolvm-port-change-warning "⚠️ 端口变更需要短暂停机（stop → update → start）"}
+    :smolvm-port-change-warning "端口变更需要短暂停机（stop → update → start）"}
 
    ;; -------------------------------------------------------- ;; :form — Labels, placeholders ;; --------------------------------------------------------
    :form
@@ -133,30 +133,30 @@
 
    ;; -------------------------------------------------------- ;; :button — Action button texts ;; --------------------------------------------------------
    :button
-   {:create-user "➕ 创建用户"
-    :add-forward "➕ 添加转发"
-    :add-proxy "➕ 添加代理"
-    :create-container "➕ 创建容器"
-    :add-port "➕"
-    :edit-remark "✏️"
-    :toggle-enable "▶️"
-    :toggle-disable "⏸️"
-    :delete "🗑️"
-    :change-password "🔑"
-    :save-quota "💾"
-    :copy "📋"
-    :show-password "👁"
-    :hide-password "👁️‍🗨️"
-    :assign "📌 分配"
-    :reassign "🔄 重分配"
-    :start-container "▶️ 启动"
+   {:create-user "创建用户"
+    :add-forward "添加转发"
+    :add-proxy "添加代理"
+    :create-container "创建容器"
+    :add-port "添加"
+    :edit-remark "编辑"
+    :toggle-enable "启用"
+    :toggle-disable "停用"
+    :delete "删除"
+    :change-password "改密"
+    :save-quota "保存"
+    :copy "复制"
+    :show-password "显示"
+    :hide-password "隐藏"
+    :assign "分配"
+    :reassign "重分配"
+    :start-container "启动"
     :confirm-assign "确认"
-    :create-machine "➕ 创建 VM"
-    :pack-machine "📦 打包"
-    :start-machine "▶️ 启动"
-    :stop-machine "⏹️ 停止"
-    :add-volume "➕ 添加挂载"
-    :remove-volume "✖"}
+    :create-machine "创建 VM"
+    :pack-machine "打包"
+    :start-machine "启动"
+    :stop-machine "停止"
+    :add-volume "添加挂载"
+    :remove-volume "移除"}
 
    ;; -------------------------------------------------------- ;; :table — Table column headers ;; --------------------------------------------------------
    :table
@@ -189,8 +189,8 @@
     :web-shell "Web Shell"
     :credentials "凭据"
     :port-proxy "端口代理"
-    :logs "📄 日志"
-    :s3 "📦 S3"
+    :logs "日志"
+    :s3 "S3"
     :user-col "用户"
     :assigned-user "分配用户"
     :host-status "主机状态"
@@ -199,20 +199,26 @@
     :filter-running "运行中"
     :filter-stopped "已停止"
     :machine-name "机器名称"
-    :smolvm-ports "VM 端口"}
+    :smolvm-ports "VM 端口"
+    :resource-name "资源名称"
+    :ingress "公网入口"
+    :engine "服务引擎"
+    :internal-target "内网目标"
+    :latency-runtime "延迟 / 运行时长"
+    :owner "负责人"}
 
    ;; -------------------------------------------------------- ;; :status — Status display texts ;; --------------------------------------------------------
    :status
-   {:running "🟢 运行中"
-    :running-text "● 运行中"
-    :stopped "🔴 已停止"
-    :disabled "● 已停用"
+   {:running "运行中"
+    :running-text "运行中"
+    :stopped "已停止"
+    :disabled "已停用"
     :disabled-text "（已停用）"
-    :dead "● 异常"
-    :abnormal "🟡 异常"
+    :dead "异常"
+    :abnormal "异常"
     :unknown "—"
-    :mounted "🟢 已挂载"
-    :mount-error "🔴 失败"
+    :mounted "已挂载"
+    :mount-error "失败"
     :title-manual-stop "已手动停用"
     :title-process-running "进程运行中"
     :title-partial-dead "部分进程未运行"
@@ -222,12 +228,12 @@
 
    ;; -------------------------------------------------------- ;; :quota — Quota display labels ;; --------------------------------------------------------
    :quota
-   {:port-forward "🔀 端口: "
-    :reverse-proxy "🌐 代理: "
-    :container "🐳 容器: "
-    :smolvm "🖥️ VM: "
-    :cpu "⚡ CPU: "
-    :memory "💾 内存: "
+   {:port-forward "端口: "
+    :reverse-proxy "代理: "
+    :container "容器: "
+    :smolvm "VM: "
+    :cpu "CPU: "
+    :memory "内存: "
     :total-cpu "CPU 总量"
     :total-mem "内存总量"}
 
@@ -301,7 +307,7 @@
     :show-password "显示密码"
     :hide-password "隐藏密码"
     :copy-password "复制密码"
-    :password-mask "●●●●●●●●●●●●"
+    :password-mask ""
     :start-container "启动容器"
     :assign-container "分配容器给用户"
     :reassign-container "重新分配容器给其他用户"
@@ -309,7 +315,7 @@
 
    ;; -------------------------------------------------------- ;; :modal — Modal dialog texts ;; --------------------------------------------------------
    :modal
-   {:change-password-title "🔑 修改用户密码"}
+   {:change-password-title "修改用户密码"}
 
    ;; -------------------------------------------------------- ;; :s3 — S3 related display texts ;; --------------------------------------------------------
    :s3
@@ -383,7 +389,7 @@
 
    ;; -------------------------------------------------------- ;; :js — Strings referenced in JavaScript (main.js) ;; --------------------------------------------------------
    :js
-   {:copied "已复制 ✓"
+   {:copied "已复制 "
     :copy-failed "复制失败，请手动复制"
     :network-error "网络错误"
     :cannot-get-pwd "无法获取密码"
@@ -408,4 +414,4 @@
     :stat-caddy "反向代理"
     :stat-docker "容器"
     :stat-smolvm "虚拟机"
-    :welcome #(str "👋 欢迎回来，" %)}})
+    :welcome #(str "欢迎回来，" %)}})
