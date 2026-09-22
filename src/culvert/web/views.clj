@@ -405,136 +405,277 @@
 ;; 总览：端口频谱
 ;; ============================================================
 
-(defn- reserved-segments []
+(defn- system-pools
+  "获取系统配置的预留端口池定义（Shell / 端口转发 / SmolVM）。"
+  []
   (let [pf (:port-forward-range config)]
     (cond-> []
       (and pf (:start pf) (:end pf))
-      (conj {:key "reserved-forward" :start (:start pf) :end (:end pf) :reserved? true
-             :label (str "转发预留 " (:start pf) "-" (:end pf)) :service "端口转发范围" :owner "系统预留"})
-      (and (:smolvm-port-start config) (:smolvm-port-end config))
-      (conj {:key "reserved-smolvm" :start (:smolvm-port-start config) :end (:smolvm-port-end config)
-             :reserved? true :label (str "微虚机预留 " (:smolvm-port-start config) "-" (:smolvm-port-end config))
-             :service "SmolVM 端口池" :owner "系统预留"})
+      (conj {:key "pool-forward"
+             :name "端口转发池"
+             :short-name "转发池"
+             :start (:start pf)
+             :end (:end pf)
+             :total (inc (- (:end pf) (:start pf)))
+             :tab "forwards"})
       (and (:ttyd-port-start config) (:ttyd-port-end config))
-      (conj {:key "reserved-ttyd" :start (:ttyd-port-start config) :end (:ttyd-port-end config)
-             :reserved? true :label (str "Shell 预留 " (:ttyd-port-start config) "-" (:ttyd-port-end config))
-             :service "ttyd 端口池" :owner "系统预留"}))))
+      (conj {:key "pool-ttyd"
+             :name "Shell 预留池"
+             :short-name "Shell"
+             :start (:ttyd-port-start config)
+             :end (:ttyd-port-end config)
+             :total (inc (- (:ttyd-port-end config) (:ttyd-port-start config)))
+             :tab "forwards"})
+      (and (:smolvm-port-start config) (:smolvm-port-end config))
+      (conj {:key "pool-smolvm"
+             :name "微虚机预留池"
+             :short-name "微虚机"
+             :start (:smolvm-port-start config)
+             :end (:smolvm-port-end config)
+             :total (inc (- (:smolvm-port-end config) (:smolvm-port-start config)))
+             :tab "smolvm"}))))
+
+(defn- pool-allocated-ports
+  "统计指定系统端口池内已被真实占用的端口总数。"
+  [pool segments]
+  (reduce + 0
+          (for [s segments
+                :when (and (<= (:start pool) (:end s))
+                           (>= (:end pool) (:start s)))]
+            (or (:port-count s) 1))))
 
 (defn port-segments
-  "构造端口频谱段：forward/docker/smolvm 的真实端口 + 系统预留范围。"
+  "构造端口频谱段：
+   1. 汇集 forward、docker、smolvm 的已分配端口与端口段；
+   2. 检查系统预留池（Shell / 转发 / 微虚机），对未被占用的预留池生成预留段；
+   3. 全量段严格按起始端口数值升序排序，保证频谱物理顺序正确。"
   [username is-admin?]
-  (concat
-   (for [e (forward/get-entries username is-admin?)
-         :when (:enabled e)]
-     (let [start (if (:isRange e) (:fromPort e) (Integer/parseInt (str (:port e))))]
-       {:key (forward-resource-key e)
-        :start start
-        :end (if (:isRange e) (:toRangePort e) start)
-        :label (str ":" start " " (str/upper-case (:protocol e)))
-        :service (str (:method e) " → " (:ip e) ":" (:toPortDisplay e))
-        :owner (:userId e)
-        :status (forward-status e)
-        :protocol (str/upper-case (:protocol e))
-        :resource-key (forward-resource-key e)
-        :tab "forwards"}))
-   (for [c (docker/get-containers username is-admin?)
-         p (keys (:ports c))
-         :when (get-in c [:ports p :enabled])]
-     {:key (str (container-resource-key c) "-" p)
-      :start (Integer/parseInt (str p))
-      :end (Integer/parseInt (str p))
-      :label (str ":" p)
-      :service (str (:name c) " → " (:name c))
-      :owner (:userId c)
-      :status (container-status (:status c))
-      :protocol "TCP"
-      :resource-key (container-resource-key c)
-      :tab "docker"})
-   (for [m (smolvm/get-machines username is-admin?)
-         p (keys (:ports m))
-         :when (get-in m [:ports p :enabled])]
-     {:key (str (machine-resource-key m) "-" p)
-      :start (Integer/parseInt (str p))
-      :end (Integer/parseInt (str p))
-      :label (str ":" p)
-      :service (str (:name m) " → " (:name m))
-      :owner (:userId m)
-      :status (container-status (:status m))
-      :protocol "TCP"
-      :resource-key (machine-resource-key m)
-      :tab "smolvm"})
-   (reserved-segments)))
+  (let [allocated
+        (concat
+         (for [e (forward/get-entries username is-admin?)
+               :when (:enabled e)]
+           (let [is-range? (boolean (:isRange e))
+                 start (if is-range? (:fromPort e) (Integer/parseInt (str (:port e))))
+                 end (if is-range? (:toRangePort e) start)
+                 cnt (inc (- end start))
+                 disp-port (if is-range?
+                             (if (= (quot start 100) (quot end 100))
+                               (str ":" start "–" (format "%02d" (rem end 100)))
+                               (str ":" start "–" end))
+                             (str ":" start))
+                 lbl (if is-range?
+                       (str ":" start "-" end " " (str/upper-case (:protocol e)) " (" cnt "端口)")
+                       (str ":" start " " (str/upper-case (:protocol e))))]
+             {:key (forward-resource-key e)
+              :start start
+              :end end
+              :is-range? is-range?
+              :port-count cnt
+              :display-port disp-port
+              :label lbl
+              :service (str (:method e) " → " (:ip e) ":" (:toPortDisplay e))
+              :owner (:userId e)
+              :status (forward-status e)
+              :protocol (str/upper-case (:protocol e))
+              :resource-key (forward-resource-key e)
+              :tab "forwards"}))
+         (for [c (docker/get-containers username is-admin?)
+               p (keys (:ports c))
+               :when (get-in c [:ports p :enabled])]
+           (let [p-int (Integer/parseInt (str p))]
+             {:key (str (container-resource-key c) "-" p)
+              :start p-int
+              :end p-int
+              :is-range? false
+              :port-count 1
+              :display-port (str ":" p)
+              :label (str ":" p " TCP")
+              :service (str "容器: " (:name c))
+              :owner (:userId c)
+              :status (container-status (:status c))
+              :protocol "TCP"
+              :resource-key (container-resource-key c)
+              :tab "docker"}))
+         (for [m (smolvm/get-machines username is-admin?)
+               p (keys (:ports m))
+               :when (get-in m [:ports p :enabled])]
+           (let [p-int (Integer/parseInt (str p))]
+             {:key (str (machine-resource-key m) "-" p)
+              :start p-int
+              :end p-int
+              :is-range? false
+              :port-count 1
+              :display-port (str ":" p)
+              :label (str ":" p " TCP")
+              :service (str "微虚机: " (:name m))
+              :owner (:userId m)
+              :status (container-status (:status m))
+              :protocol "TCP"
+              :resource-key (machine-resource-key m)
+              :tab "smolvm"})))
+        pools (system-pools)
+        ;; 对完全未被占用的预留池，在频谱上呈现独立预留色块
+        idle-pool-segs
+        (for [p pools
+              :when (zero? (pool-allocated-ports p allocated))]
+          {:key (:key p)
+           :start (:start p)
+           :end (:end p)
+           :reserved? true
+           :is-range? true
+           :port-count (:total p)
+           :display-port (str (:start p) "–" (:end p))
+           :display-sub (str (:short-name p) "预留")
+           :label (str (:name p) " " (:start p) "-" (:end p) " (" (:total p) "端口)")
+           :service (str (:name p) " · 系统分配池")
+           :owner "系统预留"
+           :status :reserved
+           :protocol "ALL"
+           :tab (:tab p)})]
+    (vec (sort-by (juxt :start :end) (concat allocated idle-pool-segs)))))
 
 (defn- spectrum-segment [seg]
-  (let [cls (cond-> "pf-seg"
-              (:reserved? seg) (str " pf-seg--reserved")
-              (:reserved? seg) (str " pf-striped-reserved"))]
+  (let [reserved? (:reserved? seg)
+        range? (:is-range? seg)
+        status (if reserved? :reserved (or (:status seg) :unknown))
+        cls (cond-> "pf-seg"
+              reserved? (str " pf-seg--reserved pf-striped-reserved")
+              (and (not reserved?) range?) (str " pf-seg--range"))
+        display-port (cond
+                       reserved? (or (:display-port seg) "预留")
+                       range? (or (:display-port seg) (str ":" (:start seg) "–" (:end seg)))
+                       :else (or (:display-port seg) (str ":" (:start seg))))
+        display-sub (cond
+                      reserved? (or (:display-sub seg) "RANGE")
+                      range? (str (or (:protocol seg) "TCP") " · " (:port-count seg 1) "P")
+                      :else (or (:protocol seg) "TCP"))]
     [:button {:type "button"
               :class cls
-              :data-status (when-not (:reserved? seg) (name (or (:status seg) :unknown)))
+              :data-status (if reserved? "reserved" (name status))
               :data-proto (or (:protocol seg) "ALL")
               :data-resource-key (:resource-key seg)
               :data-tab (:tab seg)
+              :data-focus-resource (:resource-key seg)
               :data-seg-label (:label seg)
               :data-seg-service (:service seg)
-              :data-seg-owner (:owner seg)
-              :data-seg-status (if (:reserved? seg)
+              :data-seg-owner (or (:owner seg) "—")
+              :data-seg-status (if reserved?
                                  "系统预留"
                                  (status-label (or (:status seg) :unknown)))
               :title (:label seg)}
-     [:span.pf-seg-port (if (:reserved? seg) "预留" (str ":" (:start seg)))]
-     [:span.pf-seg-proto (if (:reserved? seg) "RANGE" (or (:protocol seg) ""))]]))
+     [:span.pf-seg-port display-port]
+     [:span.pf-seg-proto display-sub]]))
 
-(defn- spectrum-band [band segments]
-  (let [items (filterv (fn [s]
-                         (case band
-                           "low" (<= (:start s) 1024)
-                           "mid" (and (> (:start s) 1024) (<= (:start s) 8192))
-                           (and (> (:start s) 8192) (<= (:start s) 65535))))
-                       segments)]
-    [:div.pf-spectrum-band {:data-band band}
-     (if (empty? items)
-       [:div.pf-spectrum-empty "空闲"]
-       (for [s items] (spectrum-segment s)))]))
+(defn- band-items [band segments]
+  (filterv (fn [s]
+             (case band
+               "low" (<= (:start s) 1024)
+               "mid" (and (> (:start s) 1024) (<= (:start s) 8192))
+               "high" (and (> (:start s) 8192) (<= (:start s) 65535))))
+           segments))
+
+(defn- band-empty-label [band]
+  (case band
+    "low" "0–1024 空闲"
+    "mid" "1025–8k 空闲"
+    "high" "8k–65k 空闲"))
+
+(defn- band-style [items any-other-has-items?]
+  (let [c (count items)]
+    (if (zero? c)
+      (if any-other-has-items?
+        "flex: 0 0 110px; min-width: 95px;"
+        "flex: 1 1 0; min-width: 100px;")
+      (str "flex: " (max 2 (* c 1.5)) " 1 auto; min-width: " (max 180 (* c 54)) "px;"))))
+
+(defn- spectrum-band [band items any-other-has-items?]
+  [:div.pf-spectrum-band
+   {:data-band band
+    :class (if (empty? items) "pf-spectrum-band--empty" "pf-spectrum-band--active")
+    :style (band-style items any-other-has-items?)}
+   (if (empty? items)
+     [:div.pf-spectrum-empty {:title (str (band-empty-label band) " (无端口占用)")}
+      (band-empty-label band)]
+     (for [s items] (spectrum-segment s)))])
 
 (defn render-port-spectrum-content
-  "渲染端口频谱内部内容：三段视觉带（低端口 45% / 中 30% / 高 25%）+ 协议筛选 + 详情条。"
+  "渲染端口频谱内部内容：
+   - 头部指标（已占用规则/端口数、系统预留池数）+ 协议筛选
+   - 系统预留池状态条（Shell / 端口转发 / SmolVM 水位与空闲统计）
+   - 三段视觉带标签（熟知端口 0-1024 / 常用服务 1025-8192 / 高端口与服务池 8193-65535）
+   - 动态弹性比例轨道（按端口密度自适应，避免空闲区浪费空间且保护高密度区横向展开）
+   - 刻度标尺、富交互详情栏与图例。"
   [username is-admin?]
-  (let [segments (vec (port-segments username is-admin?))]
+  (let [segments (port-segments username is-admin?)
+        pools (system-pools)
+        low-items (band-items "low" segments)
+        mid-items (band-items "mid" segments)
+        high-items (band-items "high" segments)
+        has-low (seq low-items)
+        has-mid (seq mid-items)
+        has-high (seq high-items)
+        active-rules (filterv #(not (:reserved? %)) segments)
+        total-rules (count active-rules)
+        total-ports (reduce + 0 (map #(or (:port-count %) 1) active-rules))]
     (h/html
      [:div.pf-card-head
       [:h3.pf-card-head-title
        (ui.icon/icon :layers {:size 16})
        "端口频谱"
        [:span.pf-tag "Port Spectrum"]
-       [:span.pf-text-muted {:style "font-size:0.7rem"} "范围 0 – 65535"]]
+       [:span.pf-badge.pf-badge-info (str total-rules " 规则已占用 · " total-ports " 端口")]
+       [:span.pf-text-muted {:style "font-size:0.7rem"} "全域 0 – 65535"]]
       [:div.pf-proto-filter {:role "group" :aria-label "协议筛选"}
        [:button {:type "button" :data-action "spectrum.filter" :data-proto "ALL" :aria-pressed "true"} "全部协议"]
        [:button {:type "button" :data-action "spectrum.filter" :data-proto "TCP" :aria-pressed "false"} "TCP"]
        [:button {:type "button" :data-action "spectrum.filter" :data-proto "UDP" :aria-pressed "false"} "UDP"]]]
+     (when (seq pools)
+       [:div.pf-spectrum-pools
+        [:span.pf-spectrum-pools-title
+         (ui.icon/icon :layers {:size 13})
+         "系统预留池:"]
+        (for [p pools
+              :let [alloc (pool-allocated-ports p segments)
+                    active? (pos? alloc)]]
+          [:span.pf-spectrum-pool-item {:key (:key p)}
+           [:span.pf-pool-tag {:class (when active? "pf-pool-tag--active")} (:name p)]
+           [:span.pf-pool-range (str (:start p) "–" (:end p))]
+           [:span.pf-pool-stat
+            (if active?
+              (str "(" alloc "/" (:total p) " 端口已占用)")
+              (str "(" (:total p) " 端口 · 空闲)"))]])])
      [:div.pf-spectrum-bandlabel
-      [:span.pf-spectrum-bandlabel-low
+      [:div.pf-spectrum-bandlabel-item
        [:span.pf-legend-dot {:style "background:#22d3ee"}]
-       "低端口区间 (0 - 1024，视觉放大)"]
-      [:span "动态与高端口区间 (1025 - 65535)"]]
+       [:span "熟知端口 (0 - 1024)"]
+       [:span.pf-text-dim (if has-low (str "· " (count low-items) " 项") "· 空闲")]]
+      [:div.pf-spectrum-bandlabel-item
+       [:span.pf-legend-dot {:style "background:#818cf8"}]
+       [:span "常用服务 (1025 - 8192)"]
+       [:span.pf-text-dim (if has-mid (str "· " (count mid-items) " 项") "· 空闲")]]
+      [:div.pf-spectrum-bandlabel-item
+       [:span.pf-legend-dot {:style "background:#38bdf8"}]
+       [:span "高端口与服务池 (8193 - 65535)"]
+       [:span.pf-text-accent (if has-high (str "· " (count high-items) " 项") "· 空闲")]]]
      [:div.pf-spectrum-track {:id "port-spectrum-track"}
-      (spectrum-band "low" segments)
-      (spectrum-band "mid" segments)
-      (spectrum-band "high" segments)]
+      (spectrum-band "low" low-items (or has-mid has-high))
+      (spectrum-band "mid" mid-items (or has-low has-high))
+      (spectrum-band "high" high-items (or has-low has-mid))]
      [:div.pf-spectrum-ticks
-      [:span "0"] [:span "1k"] [:span "8k"] [:span "32k"] [:span "65k"]]
+      [:span "0"] [:span "1024"] [:span "8k"] [:span "16k"] [:span "32k"] [:span "65535"]]
      [:div.pf-spectrum-detail {:id "port-spectrum-detail"}
       [:span.pf-spectrum-detail-hint
        (ui.icon/icon :info {:size 14})
        "悬停上方色块查看端口分配、关联资源与负责人，点击色块可跳转定位。"]]
      [:div.pf-card-head {:style "border-bottom:none;margin-bottom:0;padding-bottom:0;margin-top:0.5rem"}
       [:div.pf-legend
-       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#55C98A;border-radius:0.2rem"}] "已占用正常"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#55C98A;border-radius:0.2rem"}] "单端口正常"]
+       [:span.pf-legend-item [:span.pf-legend-dot {:style "background:linear-gradient(135deg, #4ade80, #06b6d4);border-radius:0.2rem"}] "端口段 (多端口)"]
        [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#D95D5D;border-radius:0.2rem"}] "异常冲突"]
        [:span.pf-legend-item [:span.pf-legend-dot {:style "background:#D9A441;border-radius:0.2rem"}] "高延迟/告警"]
-       [:span.pf-legend-item [:span.pf-legend-dot.pf-striped-reserved {:style "background:#334155;border-radius:0.2rem"}]
-        "预留端口范围（斜纹）"]]
-      [:span.pf-spectrum-note "* 低端口区间视觉放大，不代表实际端口数学比例。"]])))
+       [:span.pf-legend-item [:span.pf-legend-dot.pf-striped-reserved {:style "background:#242f40;border-radius:0.2rem"}]
+        "系统预留池（斜纹）"]]
+      [:span.pf-spectrum-note "* 区间按端口密度动态自适应分配宽度；点击色块可直达关联资源并高亮定位。"]])))
 
 ;; --- 模块化渲染函数 ---
 

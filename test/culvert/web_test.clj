@@ -524,3 +524,50 @@
         (is (= 200 (:status response)))
         (is (str/includes? (:body response) "pf-host"))
         (is (str/includes? (:body response) "端口池"))))))
+
+;; ============================================================
+;; 总览：端口频谱测试（数值升序排序、范围端口、预留池与渲染）
+;; ============================================================
+
+(deftest port-segments-sorted-and-normalized
+  (testing "端口段严格按起始端口数值升序排序，且正确区分单端口与端口范围"
+    (with-redefs [forward/get-entries
+                  (fn [& _]
+                    ;; 故意提供无序的真实模拟数据（与用户提供的 HTML 一致）
+                    [{:port 21000 :protocol "tcp" :method "socat" :ip "192.168.99.4" :toPortDisplay "3389" :userId "moonling" :enabled true}
+                     {:port 22224 :protocol "tcp" :method "socat" :ip "192.168.172.1" :toPortDisplay "5555" :userId "moonling" :enabled true}
+                     {:isRange true :fromPort 21001 :toRangePort 21009 :protocol "tcp" :method "socat" :ip "192.168.99.4" :toPortDisplay "21001-21009" :userId "moonling" :enabled true}
+                     {:isRange true :fromPort 19010 :toRangePort 19019 :protocol "tcp" :method "socat" :ip "192.168.99.3" :toPortDisplay "19010-19019" :userId "weilai" :enabled true}
+                     {:port 18000 :protocol "tcp" :method "socat" :ip "192.168.172.1" :toPortDisplay "22" :userId "moonling" :enabled true}])
+                  docker/get-containers (fn [& _] [])
+                  smolvm/get-machines (fn [& _] [])]
+      (let [segs (views/port-segments "admin" true)
+            starts (mapv :start segs)]
+        ;; 1. 验证排序是严格升序的
+        (is (apply <= starts) "端口段起始端口必须单调不减")
+        ;; 2. 验证范围端口具有正确属性
+        (let [range-seg (first (filter :is-range? segs))]
+          (is (some? range-seg))
+          (is (pos? (:port-count range-seg)))
+          (is (str/includes? (:label range-seg) "端口")))
+        ;; 3. 验证未被占用的预留池（如 Shell、微虚机）包含在段中且排在正确位置
+        (let [reserved (filter :reserved? segs)]
+          (is (seq reserved))
+          (is (every? #(= "系统预留" (:owner %)) reserved)))))))
+
+(deftest render-port-spectrum-content-structure
+  (testing "端口频谱内容包含卡片头部、预留池概览、协议筛选与动态带"
+    (with-redefs [forward/get-entries
+                  (fn [& _]
+                    [{:port 18000 :protocol "tcp" :method "socat" :ip "127.0.0.1" :toPortDisplay "22" :userId "admin" :enabled true}
+                     {:isRange true :fromPort 19010 :toRangePort 19019 :protocol "tcp" :method "socat" :ip "127.0.0.1" :toPortDisplay "19010-19019" :userId "admin" :enabled true}])
+                  docker/get-containers (fn [& _] [])
+                  smolvm/get-machines (fn [& _] [])]
+      (let [html (views/render-port-spectrum-content "admin" true)]
+        (is (str/includes? html "id=\"port-spectrum-track\""))
+        (is (str/includes? html "pf-spectrum-pools"))
+        (is (str/includes? html "pf-spectrum-bandlabel"))
+        (is (str/includes? html "data-band=\"low\""))
+        (is (str/includes? html "data-band=\"high\""))
+        (is (str/includes? html "pf-seg--range"))
+        (is (str/includes? html "全部协议"))))))

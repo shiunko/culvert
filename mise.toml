@@ -2,9 +2,6 @@
 babashka = "1.13.220"
 caddy = "2.11.4"
 clj-kondo = "2026.08.04"
-# cljfmt 不在 mise 的 tool registry 中，只有显式指定 github 后端才能在全新环境
-# （CI、新机器）安装；用 registry 名 cljfmt 会依赖本地已安装的 asdf 插件，
-# CI 上会报 "cljfmt not found in mise tool registry"。
 "github:weavejester/cljfmt" = "0.16.5"
 clojure = "1.12.6.1673"
 "github:tailwindlabs/tailwindcss" = "4"

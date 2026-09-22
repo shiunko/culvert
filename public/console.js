@@ -107,6 +107,24 @@ document.addEventListener("DOMContentLoaded", () => {
       var hide = proto !== "ALL" && p !== proto && p !== "ALL";
       seg.classList.toggle("pf-row-hidden", hide);
     });
+    // 协议筛选后，若区间内所有色块均被隐藏且原本非空闲，显示“无匹配协议”占位
+    document.querySelectorAll("#port-spectrum .pf-spectrum-band").forEach(function (band) {
+      var visibleSegs = band.querySelectorAll(".pf-seg:not(.pf-row-hidden)");
+      var originalEmpty = band.querySelector(".pf-spectrum-empty:not(.pf-spectrum-filter-empty)");
+      var filterEmpty = band.querySelector(".pf-spectrum-filter-empty");
+      if (!originalEmpty) {
+        if (visibleSegs.length === 0) {
+          if (!filterEmpty) {
+            filterEmpty = document.createElement("div");
+            filterEmpty.className = "pf-spectrum-empty pf-spectrum-filter-empty";
+            filterEmpty.textContent = "无匹配协议";
+            band.appendChild(filterEmpty);
+          }
+        } else if (filterEmpty) {
+          filterEmpty.remove();
+        }
+      }
+    });
   }
 
   function spectrumHint() {
@@ -137,6 +155,7 @@ document.addEventListener("DOMContentLoaded", () => {
     var service = seg.getAttribute("data-seg-service") || "—";
     var owner = seg.getAttribute("data-seg-owner") || "—";
     var status = seg.getAttribute("data-seg-status") || "—";
+    var tab = seg.getAttribute("data-tab");
     detail.innerHTML = "";
     var parts = [
       ['font-family:var(--pf-font-mono);font-weight:700;color:var(--pf-accent)', label],
@@ -144,6 +163,9 @@ document.addEventListener("DOMContentLoaded", () => {
       ["color:var(--pf-accent-2)", " ｜ 负责人: " + owner],
       ["", " ｜ 状态: " + status],
     ];
+    if (tab && !seg.classList.contains("pf-seg--reserved")) {
+      parts.push(["color:var(--pf-accent);font-size:0.68rem;margin-left:auto", "点击跳转定位 ↗"]);
+    }
     parts.forEach(function (part) {
       var span = document.createElement("span");
       span.setAttribute("style", part[0]);
