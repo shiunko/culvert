@@ -274,8 +274,13 @@
           csp (get-in response [:headers "Content-Security-Policy"])]
       (is (str/includes? csp "default-src 'self'"))
       (is (str/includes? csp "frame-ancestors 'none'"))
-      (is (not (str/includes? csp "'unsafe-inline'")))
-      (is (str/includes? csp "form-action 'self'")))))
+      (is (str/includes? csp "form-action 'self'"))
+      ;; script-src 绝不允许 unsafe-inline（XSS 风险）
+      (let [script-src (second (re-find #"script-src ([^;]+)" csp))]
+        (is (not (str/includes? (or script-src "") "'unsafe-inline'"))))
+      ;; style-src 允许 unsafe-inline（htmx 写 element.style 需要）
+      (let [style-src (second (re-find #"style-src ([^;]+)" csp))]
+        (is (str/includes? (or style-src "") "'unsafe-inline'"))))))
 
 ;; ============================================================
 ;; Rate Limit Middleware Integration Test

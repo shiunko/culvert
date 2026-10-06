@@ -235,7 +235,7 @@
    "Permissions-Policy" "camera=(), microphone=(), geolocation=()"
    "Content-Security-Policy" (str "default-src 'self'; "
                                   "script-src 'self' https://unpkg.com https://cdn.jsdelivr.net; "
-                                  "style-src 'self' https://cdn.jsdelivr.net; "
+                                  "style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
                                   "img-src 'self' data:; "
                                   "connect-src 'self'; "
                                   "frame-ancestors 'none'; "
