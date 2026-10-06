@@ -245,15 +245,26 @@ document.addEventListener("DOMContentLoaded", () => {
           showToast(data.error, "error");
           return;
         }
-        activeLogContainerId = containerId;
         // Open ttyd in a new popup window (same pattern as shell access)
         var logWindow = window.open(data.url, "_blank",
           "width=900,height=600,menubar=no,toolbar=no,location=yes,status=no");
 
-        // Poll popup window: when user closes it, stop log ttyd
+        // 弹窗被拦截时 window.open 返回 null 或立即 closed
+        if (!logWindow || logWindow.closed) {
+          fetch("/docker/logs/stop", {
+            method: "POST",
+            headers: {"Content-Type": "application/x-www-form-urlencoded", "X-CSRF-Token": csrf},
+            body: "id=" + encodeURIComponent(containerId),
+          }).catch(function () {});
+          showToast("弹窗被浏览器拦截，请在地址栏允许弹出窗口后重试", "warning");
+          return;
+        }
+
+        // 确认弹窗已打开，再登记 active 状态和轮询
+        activeLogContainerId = containerId;
         stopLogPoll();
         logPollTimer = setInterval(function () {
-          if (!logWindow || logWindow.closed) {
+          if (logWindow.closed) {
             stopLogTtyd();
           }
         }, 1000);
