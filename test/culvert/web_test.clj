@@ -651,39 +651,38 @@
                     docker/reveal-webshell-credentials (fn [& _] {:user "dev_ab" :pass "pw-123"})
                     sse/broadcast! (fn [msg] (swap! broadcasts conj msg))
                     activity/record! (fn [event] (swap! recorded conj event))]
-        (handlers/route-dispatcher {:request-method :get
-                                    :uri "/admin/containers"
-                                    :headers {"authorization" (basic-authorization "admin" "secret")}})
-        (let [csrf-token (first (keys @web/csrf-store))
+        (let [csrf-token (web/csrf-generate (admin-user))
               response (handlers/route-dispatcher
                         (admin-terminal-request :post "/admin/containers/terminal/open" csrf-token))]
           (is (= 200 (:status response)))
           (is (str/includes? (:body response) "terminalModal"))
           (is (str/includes? (:body response) "pw-123"))
           (is (some #(= [:docker/terminal-open] [(:action %)]) @recorded))
-          (is (some #(some #{"admin-containers-tbody"} (:panels %)) @broadcasts)))))))
+          (is (some #(some #{"docker-tbody"} (:panels %)) @broadcasts)))))))
 
 (deftest admin-terminal-close-refreshes-container-table
-  (testing "关闭终端返回管理表片段并记录活动"
+  (testing "关闭终端返回 docker 容器网格片段并记录活动"
     (reset! web/csrf-store {})
     (let [closed (atom 0)
           recorded (atom [])]
       (with-redefs [auth/authenticate (fn [_ _] (admin-user))
-                    docker/get-all-host-containers (fn [] [])
+                    docker/get-all-host-containers (fn [] [{:id "abc123def456"
+                                                            :name "host-box"
+                                                            :image "ubuntu"
+                                                            :state "running"
+                                                            :assignedUser nil}])
+                    docker/get-containers (fn [_ _] [])
                     docker/close-webshell! (fn [target _actor]
                                              (swap! closed inc)
                                              (is (= "host-box" target))
                                              {:status "ok"})
                     sse/broadcast! (fn [_] nil)
                     activity/record! (fn [event] (swap! recorded conj event))]
-        (handlers/route-dispatcher {:request-method :get
-                                    :uri "/admin/containers"
-                                    :headers {"authorization" (basic-authorization "admin" "secret")}})
-        (let [csrf-token (first (keys @web/csrf-store))
+        (let [csrf-token (web/csrf-generate (admin-user))
               response (handlers/route-dispatcher
                         (admin-terminal-request :post "/admin/containers/terminal/close" csrf-token))]
           (is (= 200 (:status response)))
-          (is (str/includes? (:body response) "pf-row-actions"))
+          (is (str/includes? (:body response) "pf-resource-card"))
           (is (= 1 @closed))
           (is (some #(= [:docker/terminal-close] [(:action %)]) @recorded)))))))
 

@@ -1213,8 +1213,65 @@
         [:button.pf-btn {:type "button" :data-action "terminal.close"} (:close btn)]]
        [:form.pf-modal-backdrop-close {:method "dialog"} [:button "close"]]]])))
 
+(defn- admin-terminal-btns
+  "管理员终端按钮组（开启 / 查看凭据 / 关闭）。
+   c 必须有 :name、:_host-state（宿主机容器状态）和 :_webshell。"
+  [c csrf-token tip btn]
+  (let [ws (:_webshell c)
+        running? (= (:_host-state c) "running")
+        terminal-vals (mutation-vals csrf-token {:target (:name c)})]
+    (list
+     (cond
+       (= (:status ws) "running")
+       [:a.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
+        {:href (:url ws) :target "_blank" :rel "noopener noreferrer"
+         :title (str (:open-terminal-window btn) "（" (:createdBy ws) "）")}
+        (ui.icon/icon :terminal {:size 14})]
+       (not running?)
+       [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+        {:type "button" :disabled true
+         :title (:terminal-not-running (:validation i18n/strings))}
+        (ui.icon/icon :terminal {:size 14})]
+       :else
+       [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+        {:type "button" :title (:open-terminal (:tooltip i18n/strings))
+         :hx-post "/admin/containers/terminal/open"
+         :hx-target "#terminal-modal-container"
+         :hx-swap "innerHTML"
+         :hx-vals terminal-vals}
+        (ui.icon/icon :terminal {:size 14})])
+     (when (:status ws)
+       (list
+        [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+         {:type "button" :title (:terminal-credentials (:tooltip i18n/strings))
+          :hx-post "/admin/containers/terminal/credentials"
+          :hx-target "#terminal-modal-container"
+          :hx-swap "innerHTML"
+          :hx-vals terminal-vals}
+         (ui.icon/icon :key {:size 14})]
+        [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-error
+         {:type "button" :title (:stop-terminal (:tooltip i18n/strings))
+          :hx-post "/admin/containers/terminal/close"
+          :hx-target "#docker-tbody"
+          :hx-swap "innerHTML"
+          :hx-vals terminal-vals}
+         (ui.icon/icon :x {:size 14})])))))
+
 (defn render-docker-tbody [username is-admin? csrf-token]
-  (let [docker-entries (docker/get-containers username is-admin?)
+  (let [docker-entries
+        (if is-admin?
+          ;; 管理员：宿主机所有容器，托管容器叠加完整数据
+          (let [managed-map (into {} (map (fn [c] [(:id c) c])
+                                          (docker/get-containers username true)))
+                host-containers (docker/get-all-host-containers)
+                sorted (sort-by (juxt #(not= (:state %) "running") :name) host-containers)]
+            (map (fn [hc]
+                   (if-let [full (get managed-map (:appContainerId hc))]
+                     (assoc full :_webshell (:webshell hc) :_host-state (:state hc))
+                     (assoc hc :_unmanaged true :_host-state (:state hc))))
+                 sorted))
+          ;; 普通用户：仅托管容器
+          (docker/get-containers username false))
         tip (:tooltip i18n/strings)
         btn (:button i18n/strings)
         fm (:form i18n/strings)
@@ -1224,136 +1281,164 @@
      (if (empty? docker-entries)
        [:div.pf-empty (:no-containers (:empty i18n/strings))]
        (for [[idx c] (map-indexed vector docker-entries)]
-         [:div.card.pf-resource-card {:data-container-id (:id c)
-                                      :data-resource-kind "docker"
-                                      :data-resource-id (:id c)
-                                      :data-resource-key (container-resource-key c)
-                                      :data-tab "docker"
-                                      :data-credential-endpoint "/docker/credentials"}
-          ;; -- Card header: name, status, actions --
-          [:div.pf-resource-card-header
-           [:div.pf-row-wrap
-            [:span.pf-badge.pf-badge-ghost (str "#" (inc idx))]
-            [:code {:title (:id c) :style "font-weight:700"} (:name c)]
-            (when is-admin? [:span.pf-badge.pf-badge-outline (:userId c)])
-            (resource-status-badge (:status c) sts)]
-           [:div.pf-row
-            [:button.pf-btn.pf-btn-ghost.pf-btn-xs
-             {:title (:view-logs tip)
-              :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id c)) "UTF-8"))
-              :hx-target "#log-panel-container"
-              :hx-swap "innerHTML"}
-             (ui.icon/icon :file-text {:size 14})]
-            (when (= (:status c) "stopped")
-              [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
-               {:title (:start-container tip)
-                :hx-post "/docker/start"
-                :hx-target "#docker-tbody"
-                :hx-swap "innerHTML"
-                :hx-confirm (str "确定启动容器 " (:name c) " 吗？")
-                :hx-vals (mutation-vals csrf-token {:id (:id c)})}
-               (ui.icon/icon :play {:size 14})])
-            [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-error
-             {:title (:delete-container tip)
-              :hx-post "/docker/kill"
-              :hx-target "#docker-tbody"
-              :hx-swap "innerHTML"
-              :hx-confirm (:delete-container cfm)
-              :hx-vals (mutation-vals csrf-token {:id (:id c)})}
-             (:delete btn)]]]
-
-          ;; -- Info row: image + resources --
-          [:div.pf-resource-card-meta
-           [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image c)]]
-           [:span [:span.pf-text-muted "资源: "] [:small (str (:cpuLimit c) "C / " (:memLimit c))
-                                                (when (:gpu c) [:span.pf-text-success " " (ui.icon/icon :cpu {:size 12}) " GPU"])]]
-           (when (:shellUrl c)
-             [:span.pf-row {:style "gap:0.25rem"}
-              [:span.pf-text-muted "Shell:"]
+         (if (:_unmanaged c)
+           ;; ---- 宿主机未托管容器（无 app 记录） ----
+           [:div.card.pf-resource-card
+            {:data-container-id (:id c)
+             :data-resource-kind "docker"
+             :data-tab "docker"}
+            [:div.pf-resource-card-header
+             [:div.pf-row-wrap
+              [:span.pf-badge.pf-badge-ghost (str "#" (inc idx))]
+              [:code {:style "font-weight:700"} (:name c)]
+              [:span.pf-badge.pf-badge-warning "未登记"]
+              (resource-status-badge (if (= (:state c) "running") "running" "stopped") sts)]
+             [:div.pf-row
               [:button.pf-btn.pf-btn-ghost.pf-btn-xs
-               {:title (:open-shell tip)
-                :data-shell-open (:shellUrl c)
-                :data-shell-user (:shellUser c)}
-               (ui.icon/icon :external-link {:size 13}) " " [:code (:shellToken c)]]
+               {:title (:view-logs tip)
+                :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id c)) "UTF-8"))
+                :hx-target "#log-panel-container"
+                :hx-swap "innerHTML"}
+               (ui.icon/icon :file-text {:size 14})]
+              (admin-terminal-btns c csrf-token tip btn)]]
+            [:div.pf-resource-card-meta
+             [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image c)]]
+             (when-let [cid (:id c)]
+               [:span [:span.pf-text-muted "ID: "]
+                [:code (subs cid 0 (min 12 (count cid)))]])]]
+
+           ;; ---- 托管容器（完整 card） ----
+           [:div.card.pf-resource-card {:data-container-id (:id c)
+                                        :data-resource-kind "docker"
+                                        :data-resource-id (:id c)
+                                        :data-resource-key (container-resource-key c)
+                                        :data-tab "docker"
+                                        :data-credential-endpoint "/docker/credentials"}
+            ;; -- Card header: name, status, actions --
+            [:div.pf-resource-card-header
+             [:div.pf-row-wrap
+              [:span.pf-badge.pf-badge-ghost (str "#" (inc idx))]
+              [:code {:title (:id c) :style "font-weight:700"} (:name c)]
+              (when is-admin? [:span.pf-badge.pf-badge-outline (:userId c)])
+              (resource-status-badge (:status c) sts)]
+             [:div.pf-row
               [:button.pf-btn.pf-btn-ghost.pf-btn-xs
-               {:title (:copy-shell-url tip)
-                :data-shell-copy (:shellUrl c)
-                :data-shell-user (:shellUser c)}
-               (ui.icon/icon :copy {:size 13})]])
-           (when (get-in c [:s3Mount :enabled])
-             (let [sm (:s3Mount c)]
-               [:span [:span.pf-text-muted "S3: "]
-                (cond
-                  (= (:status sm) "mounted") [:span.pf-text-success {:title (str (:endpoint sm "AWS S3") " / " (:bucket sm) " → " (:mountPoint sm))} (:mounted sts)]
-                  (= (:status sm) "error") [:span.pf-text-error {:title (str (:endpoint sm "AWS S3") " / " (:bucket sm))} (:mount-error sts)]
-                  :else [:span.pf-text-warning (:status sm)])]))]
-
-          ;; -- Three-column grid: Usage | Credentials | Ports --
-          [:div.pf-resource-card-grid
-           ;; Usage column
-           [:div.resource-usage-cell {:data-container-name (:name c)}
-            (if (= (:status c) "running")
-              [:div.pf-stack
-               [:div.pf-row
-                [:span {:style "font-size:0.7rem;font-weight:700;width:2rem"} "CPU"]
-                [:progress.resource-bar-cpu {:value "0" :max "100"}]
-                [:span.resource-bar-text {:style "font-size:0.7rem"} "—"]]
-               [:div.pf-row
-                [:span {:style "font-size:0.7rem;font-weight:700;width:2rem"} "MEM"]
-                [:progress.resource-bar-mem {:value "0" :max "100"}]
-                [:span.resource-bar-text {:style "font-size:0.7rem"} "—"]]]
-              [:span.pf-text-muted (:unknown sts)])]
-
-           ;; Credentials column
-           [:div.credential-cell
-            [:div.pf-row
-             (ui.icon/icon :user {:size 14})
-             [:code.pf-mono {:style "font-size:0.75rem"} (:shellUser c)]
-             [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-username tip) :data-copy (:shellUser c)} (:copy btn)]]
-            [:div.pf-row
-             (ui.icon/icon :key {:size 14})
-             [:input.cred-pass-input.pf-input.pf-input-inline {:style "width:6rem" :type "password" :value (:shellPassMasked c) :readonly true :data-container-id (:id c)}]
-             [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:show-password tip) :data-container-id (:id c)} (:show-password btn)]
-             [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-password tip) :data-copy-pass (:id c)} (:copy btn)]]]
-
-           ;; Ports column
-           [:div.ports-cell
-            (let [ports-keys (keys (:ports c))]
-              (list
-               (if (empty? ports-keys)
-                 [:span.pf-text-muted (:unknown sts)]
-                 (for [p ports-keys]
-                   (let [pi (get-in c [:ports p])]
-                     [:div.pf-row
-                      [:code (str ":" p)]
-                      (when (seq (:url pi))
-                        (list " → " [:a.pf-link {:href (:url pi) :target "_blank" :rel "noopener noreferrer" :style "font-size:0.75rem"} (:domain pi)]))
-                      [:span.pf-row
-                       [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
-                        {:title (if (:enabled pi) (:disable tip) (:enable tip))
-                         :hx-post "/docker/port/toggle"
-                         :hx-target "#docker-tbody"
-                         :hx-swap "innerHTML"
-                         :hx-vals (mutation-vals csrf-token {:id (:id c) :port p})}
-                        (ui.icon/icon (if (:enabled pi) :pause :play) {:size 13})]
-                       [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
-                        {:title (:unexpose tip)
-                         :hx-post "/docker/port/remove"
-                         :hx-target "#docker-tbody"
-                         :hx-swap "innerHTML"
-                         :hx-confirm (:delete-port cfm)
-                         :hx-vals (mutation-vals csrf-token {:id (:id c) :port p})}
-                        (:delete btn)]]])))
-               [:div.pf-row {:style "margin-top:0.25rem"}
-                [:input.pf-input.pf-input-inline {:style "width:4.5rem" :type "number" :name "port" :placeholder "端口" :min 1 :max 65535}]
-                [:input.pf-input.pf-input-inline {:style "width:6rem" :type "text" :name "remark" :placeholder (:placeholder-remark fm)}]
-                [:button.pf-btn.pf-btn-outline.pf-btn-success.pf-btn-xs
-                 {:hx-post "/docker/port/add"
+               {:title (:view-logs tip)
+                :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id c)) "UTF-8"))
+                :hx-target "#log-panel-container"
+                :hx-swap "innerHTML"}
+               (ui.icon/icon :file-text {:size 14})]
+              (when is-admin? (admin-terminal-btns c csrf-token tip btn))
+              (when (= (:status c) "stopped")
+                [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
+                 {:title (:start-container tip)
+                  :hx-post "/docker/start"
                   :hx-target "#docker-tbody"
                   :hx-swap "innerHTML"
-                  :hx-include "closest .card"
+                  :hx-confirm (str "确定启动容器 " (:name c) " 吗？")
                   :hx-vals (mutation-vals csrf-token {:id (:id c)})}
-                 (:add-port btn)]]))]]])))))
+                 (ui.icon/icon :play {:size 14})])
+              [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-error
+               {:title (:delete-container tip)
+                :hx-post "/docker/kill"
+                :hx-target "#docker-tbody"
+                :hx-swap "innerHTML"
+                :hx-confirm (:delete-container cfm)
+                :hx-vals (mutation-vals csrf-token {:id (:id c)})}
+               (:delete btn)]]]
+
+          ;; -- Info row: image + resources --
+            [:div.pf-resource-card-meta
+             [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image c)]]
+             [:span [:span.pf-text-muted "资源: "] [:small (str (:cpuLimit c) "C / " (:memLimit c))
+                                                  (when (:gpu c) [:span.pf-text-success " " (ui.icon/icon :cpu {:size 12}) " GPU"])]]
+             (when (:shellUrl c)
+               [:span.pf-row {:style "gap:0.25rem"}
+                [:span.pf-text-muted "Shell:"]
+                [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                 {:title (:open-shell tip)
+                  :data-shell-open (:shellUrl c)
+                  :data-shell-user (:shellUser c)}
+                 (ui.icon/icon :external-link {:size 13}) " " [:code (:shellToken c)]]
+                [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                 {:title (:copy-shell-url tip)
+                  :data-shell-copy (:shellUrl c)
+                  :data-shell-user (:shellUser c)}
+                 (ui.icon/icon :copy {:size 13})]])
+             (when (get-in c [:s3Mount :enabled])
+               (let [sm (:s3Mount c)]
+                 [:span [:span.pf-text-muted "S3: "]
+                  (cond
+                    (= (:status sm) "mounted") [:span.pf-text-success {:title (str (:endpoint sm "AWS S3") " / " (:bucket sm) " → " (:mountPoint sm))} (:mounted sts)]
+                    (= (:status sm) "error") [:span.pf-text-error {:title (str (:endpoint sm "AWS S3") " / " (:bucket sm))} (:mount-error sts)]
+                    :else [:span.pf-text-warning (:status sm)])]))]
+
+          ;; -- Three-column grid: Usage | Credentials | Ports --
+            [:div.pf-resource-card-grid
+           ;; Usage column
+             [:div.resource-usage-cell {:data-container-name (:name c)}
+              (if (= (:status c) "running")
+                [:div.pf-stack
+                 [:div.pf-row
+                  [:span {:style "font-size:0.7rem;font-weight:700;width:2rem"} "CPU"]
+                  [:progress.resource-bar-cpu {:value "0" :max "100"}]
+                  [:span.resource-bar-text {:style "font-size:0.7rem"} "—"]]
+                 [:div.pf-row
+                  [:span {:style "font-size:0.7rem;font-weight:700;width:2rem"} "MEM"]
+                  [:progress.resource-bar-mem {:value "0" :max "100"}]
+                  [:span.resource-bar-text {:style "font-size:0.7rem"} "—"]]]
+                [:span.pf-text-muted (:unknown sts)])]
+
+           ;; Credentials column
+             [:div.credential-cell
+              [:div.pf-row
+               (ui.icon/icon :user {:size 14})
+               [:code.pf-mono {:style "font-size:0.75rem"} (:shellUser c)]
+               [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-username tip) :data-copy (:shellUser c)} (:copy btn)]]
+              [:div.pf-row
+               (ui.icon/icon :key {:size 14})
+               [:input.cred-pass-input.pf-input.pf-input-inline {:style "width:6rem" :type "password" :value (:shellPassMasked c) :readonly true :data-container-id (:id c)}]
+               [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:show-password tip) :data-container-id (:id c)} (:show-password btn)]
+               [:button.pf-btn.pf-btn-ghost.pf-btn-xs {:title (:copy-password tip) :data-copy-pass (:id c)} (:copy btn)]]]
+
+           ;; Ports column
+             [:div.ports-cell
+              (let [ports-keys (keys (:ports c))]
+                (list
+                 (if (empty? ports-keys)
+                   [:span.pf-text-muted (:unknown sts)]
+                   (for [p ports-keys]
+                     (let [pi (get-in c [:ports p])]
+                       [:div.pf-row
+                        [:code (str ":" p)]
+                        (when (seq (:url pi))
+                          (list " → " [:a.pf-link {:href (:url pi) :target "_blank" :rel "noopener noreferrer" :style "font-size:0.75rem"} (:domain pi)]))
+                        [:span.pf-row
+                         [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square
+                          {:title (if (:enabled pi) (:disable tip) (:enable tip))
+                           :hx-post "/docker/port/toggle"
+                           :hx-target "#docker-tbody"
+                           :hx-swap "innerHTML"
+                           :hx-vals (mutation-vals csrf-token {:id (:id c) :port p})}
+                          (ui.icon/icon (if (:enabled pi) :pause :play) {:size 13})]
+                         [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-btn-square.pf-text-error
+                          {:title (:unexpose tip)
+                           :hx-post "/docker/port/remove"
+                           :hx-target "#docker-tbody"
+                           :hx-swap "innerHTML"
+                           :hx-confirm (:delete-port cfm)
+                           :hx-vals (mutation-vals csrf-token {:id (:id c) :port p})}
+                          (:delete btn)]]])))
+                 [:div.pf-row {:style "margin-top:0.25rem"}
+                  [:input.pf-input.pf-input-inline {:style "width:4.5rem" :type "number" :name "port" :placeholder "端口" :min 1 :max 65535}]
+                  [:input.pf-input.pf-input-inline {:style "width:6rem" :type "text" :name "remark" :placeholder (:placeholder-remark fm)}]
+                  [:button.pf-btn.pf-btn-outline.pf-btn-success.pf-btn-xs
+                   {:hx-post "/docker/port/add"
+                    :hx-target "#docker-tbody"
+                    :hx-swap "innerHTML"
+                    :hx-include "closest .card"
+                    :hx-vals (mutation-vals csrf-token {:id (:id c)})}
+                   (:add-port btn)]]))]]]))))))
 
 ;; ============================================================
 ;; SmolVM Table Rendering
@@ -1521,10 +1606,6 @@
                           (list [:div {:id "quota-bar"}
                                  (render-quota-bar-content (:username ctx) (:user ctx))]))
                 :atoms #{forward/state caddy/state docker/state smolvm/state}}
-   "admin-containers-tbody" {:render (fn [ctx]
-                                       (list [:tbody {:id "admin-containers-tbody"}
-                                              (render-admin-containers-tbody (:csrf ctx))]))
-                             :atoms #{}}
    "overview-stats" {:render (fn [ctx]
                                (list [:div {:id "overview-stats"}
                                       (render-overview-stats-content (:username ctx) (:user ctx))]))
@@ -1716,13 +1797,6 @@
            :keywords "vm smolvm 虚拟机 微虚机 创建"
            :icon :server
            :attrs {:data-action "drawer.open" :data-drawer "smolvm-drawer"}})
-    is-admin?
-    (conj {:id "manage-hosts" :category "常用命令" :label "主机容器分配"
-           :description "进入管理页的主机容器分配子页"
-           :keywords "admin manage host container 管理 主机 分配"
-           :icon :shield
-           :attrs {:data-action "tabs.activate" :data-tab "admin"}
-           :then "[data-subtab=\"admin-hosts\"]"})
     true
     (conj {:id "nav-overview" :category "页面跳转" :label "返回总览"
            :description "查看首屏接线图、端口频谱与运行指标"
@@ -1898,13 +1972,9 @@
             [:div.pf-host {:id "host-metrics" :hx-get "/panel/host"
                            :hx-trigger "refresh-host from:body, every 60s" :hx-swap "innerHTML"}
              (render-host-metrics-content username is-admin?)])
-          (when is-admin?
-            [:div.pf-segmented {:role "tablist" :aria-label "管理员子导航" :id "admin-subtabs"}
-             [:button.pf-segmented-btn {:type "button" :role "tab" :id "subtabbtn-admin-users" :data-subtab "admin-users" :aria-selected "true" :aria-controls "subtab-admin-users" :tabindex "0"} (:admin-panel dash)]
-             [:button.pf-segmented-btn {:type "button" :role "tab" :id "subtabbtn-admin-hosts" :data-subtab "admin-hosts" :aria-selected "false" :aria-controls "subtab-admin-hosts" :tabindex "-1"} (:admin-container-panel dash)]])
         ;; Admin Panel
           (when is-admin?
-            [:div {:data-tab-panel-sub "admin-users" :id "subtab-admin-users"}
+            [:div {:id "subtab-admin-users"}
              [:div.pf-card.pf-card--accent-error {:id "admin-panel"}
               [:div.pf-card-body
                [:div.pf-card-title.pf-card-title--error (:admin-panel dash)]
@@ -1949,32 +2019,7 @@
                    [:th (:created tbl)]
                    [:th (:actions tbl)]]]
                  [:tbody {:id "admin-users-tbody" :hx-get "/panel/users" :hx-trigger "refresh-admin from:body, every 120s" :hx-swap "innerHTML" :data-loaded "false"}
-                  (ui.skeleton/table-rows 10 3)]]]]]])
-
-        ;; Host Container Assignment Card
-          (when is-admin?
-            [:div {:data-tab-panel-sub "admin-hosts" :id "subtab-admin-hosts" :hidden true}
-             [:div.pf-card.pf-card--accent-info {:id "host-containers-panel"}
-              [:div.pf-card-body
-               [:div.pf-card-title.pf-card-title--info (:admin-container-panel dash)]
-               [:p.pf-text-muted (:admin-container-desc dash)]
-               (let [hcs (docker/get-all-host-containers)
-                     total (count hcs)
-                     assigned (count (filter :assignedUser hcs))]
-                 [:p.pf-callout-info {:id "admin-container-summary"}
-                  ((:admin-container-summary dash) {:total total :assigned assigned :unassigned (- total assigned)})])
-               [:div.pf-table-wrap
-                [:table.pf-table.pf-table--zebra {:id "admin-containers-table"}
-                 [:thead
-                  [:tr
-                   [:th (:container-name tbl)]
-                   [:th (:container-id tbl)]
-                   [:th (:image tbl)]
-                   [:th (:host-status tbl)]
-                   [:th (:assigned-user tbl)]
-                   [:th (:actions tbl)]]]
-                 [:tbody {:id "admin-containers-tbody" :hx-get "/admin/containers" :hx-trigger "refresh-admin-containers from:body, every 120s" :hx-swap "innerHTML" :data-loaded "false"}
-                  (ui.skeleton/table-rows 6 3)]]]]]])]
+                  (ui.skeleton/table-rows 10 3)]]]]]])]
 
          [:section.pf-panel {:id "tab-forwards" :data-tab-panel "forwards" :role "tabpanel" :aria-labelledby "tabbtn-forwards" :hidden true}
           [:div.pf-panel-header

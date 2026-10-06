@@ -232,7 +232,6 @@
                           {:cpu-pct 0.0 :mem-pct 0.0 :mem-used "—" :mem-limit "—"})]))]
     (core/json-response result)))
 
-
 ;; ============================================================
 ;; Route Dispatcher Handlers
 ;; ============================================================
@@ -343,7 +342,7 @@
         activity {:action :docker/create
                   :resource {:kind "container" :id (:image params)}
                   :summary (str "创建容器（镜像 " (:image params) "）")}]
-    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody"]
                    (fn [ctx]
                      (let [s3-config (when (seq (:s3Bucket params))
                                        {:endpoint (:s3Endpoint params)
@@ -365,7 +364,7 @@
         activity {:action :docker/kill
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "删除容器 " (:id params))}]
-    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody"]
                    (fn [ctx]
                      (docker/kill-container! (:id params) (:username ctx) (:is-admin ctx)))
                    (:container-deleted (:toast i18n/strings)))))
@@ -459,7 +458,7 @@
         activity {:action :docker/start
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "启动容器 " (:id params))}]
-    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody"]
                    (fn [ctx]
                      (docker/start-container! (:id params) (:username ctx) (:is-admin ctx)))
                    ((:container-started (:toast i18n/strings)) (:id params)))))
@@ -597,30 +596,6 @@
                    ((:machine-packed (:toast i18n/strings)) (:id params)))))
 
 ;; --- Admin Container Management Handlers ---
-
-(defn- handle-admin-containers [_req]
-  {:status 200
-   :headers {"Content-Type" "text/html; charset=utf-8"}
-   :body (str (views/render-admin-containers-tbody (core/csrf-generate)))})
-
-(defn- handle-admin-assign-container [req]
-  (let [params (core/parse-form-body req)
-        csrf-token (core/get-csrf-token req params)
-        activity {:action :admin/assign-container
-                  :resource {:kind "container" :id (:name params)}
-                  :summary (str "分配容器 " (:name params) " 给 " (:user-id params))}]
-    (if-not (core/csrf-validate csrf-token)
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [container-name (:name params)
-              user-id (:user-id params)]
-          (docker/assign-container! container-name user-id)
-          (broadcast-mutation! req {:event "refresh" :panels ["admin-containers-tbody" "docker-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (core/htmx-response (views/render-admin-containers-tbody csrf-token)
-                              ((:container-assigned (:toast i18n/strings)) {:name container-name :user user-id}) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (core/htmx-error-response (views/render-admin-containers-tbody csrf-token) e))))))
 
 ;; --- Admin Handlers ---
 
@@ -829,7 +804,7 @@
         (let [webshell (docker/open-webshell! target actor)
               credentials (docker/reveal-webshell-credentials target actor)]
           (broadcast-mutation! req
-                               {:event "refresh" :panels ["admin-containers-tbody" "docker-tbody"]}
+                               {:event "refresh" :panels ["docker-tbody"]}
                                activity)
           (core/htmx-response (views/render-terminal-panel
                                (merge webshell credentials))
@@ -872,14 +847,18 @@
       (try
         (docker/close-webshell! target actor)
         (broadcast-mutation! req
-                             {:event "refresh" :panels ["admin-containers-tbody" "docker-tbody"]}
+                             {:event "refresh" :panels ["docker-tbody"]}
                              activity)
-        (core/htmx-response (views/render-admin-containers-tbody csrf-token)
-                            ((:terminal-closed (:toast i18n/strings)) target)
-                            "success")
+        (let [user (:user req)]
+          (core/htmx-response
+           (views/render-docker-tbody (:username user) true csrf-token)
+           ((:terminal-closed (:toast i18n/strings)) target)
+           "success"))
         (catch Exception e
           (record-failure! req activity e)
-          (core/htmx-error-response (views/render-admin-containers-tbody csrf-token) e))))))
+          (let [user (:user req)]
+            (core/htmx-error-response
+             (views/render-docker-tbody (:username user) true csrf-token) e)))))))
 
 ;; ============================================================
 ;; Main Router Dispatcher
@@ -1093,13 +1072,6 @@
       ;; Admin password form GET (htmx modal)
       (and (= request-method :get) (= uri "/admin/password-form"))
       ((core/wrap-auth (admin-only handle-admin-password-form)) req)
-
-      ;; Admin container management (admin-only)
-      (and (= request-method :get) (= uri "/admin/containers"))
-      ((core/wrap-auth (admin-only handle-admin-containers)) req)
-
-      (and (= request-method :post) (= uri "/admin/containers/assign"))
-      ((core/wrap-auth (admin-only handle-admin-assign-container)) req)
 
       ;; 管理员容器终端（持久 webshell）
       (and (= request-method :post) (= uri "/admin/containers/terminal/open"))

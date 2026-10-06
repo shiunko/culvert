@@ -77,7 +77,6 @@ document.addEventListener("DOMContentLoaded", () => {
     "activity-feed": "refresh-activity",
     "host-metrics": "refresh-host",
     "admin-users-tbody": "refresh-admin",
-    "admin-containers-tbody": "refresh-admin-containers",
     "wall-kpis": "refresh-wall-kpis",
     "wall-topology": "refresh-wall-topology",
     "wall-alerts": "refresh-wall-alerts",
@@ -471,61 +470,6 @@ document.addEventListener("DOMContentLoaded", () => {
           // Silently ignore — WS stats push will update soon
         });
     }
-    // Re-apply container filter after HTMX swaps admin-containers-tbody
-    if (evt.detail.target.id === "admin-containers-tbody") {
-      var activeBtn = document.querySelector("#admin-containers-tbody .filter-btn.pf-btn-info");
-      if (activeBtn) {
-        filterContainers(activeBtn.getAttribute("data-filter"));
-      } else {
-        applyDefaultContainerFilter();
-      }
-    }
   });
 
-  // ============================================================
-  // Admin Container Filter
-  // ============================================================
-  var currentContainerFilter = "running";
-
-  function filterContainers(filter) {
-    currentContainerFilter = filter;
-    var tbody = document.getElementById("admin-containers-tbody");
-    if (!tbody) return;
-
-    var rows = tbody.querySelectorAll("tr[data-state]");
-    rows.forEach(function (row) {
-      if (filter === "all" || row.getAttribute("data-state") === filter) {
-        row.classList.remove("hidden");
-      } else {
-        row.classList.add("hidden");
-      }
-    });
-
-    // Update active button state
-    var buttons = tbody.querySelectorAll(".filter-btn");
-    buttons.forEach(function (btn) {
-      if (btn.getAttribute("data-filter") === filter) {
-        btn.classList.add("pf-btn-info");
-      } else {
-        btn.classList.remove("pf-btn-info");
-      }
-    });
-  }
-
-  function applyDefaultContainerFilter() {
-    var btn = document.querySelector('#admin-containers-tbody .filter-btn[data-filter="running"]');
-    if (btn) {
-      filterContainers("running");
-    }
-  }
-
-  // Delegated click handler for filter buttons
-  document.body.addEventListener("click", function (e) {
-    var btn = e.target.closest("#admin-containers-tbody .filter-btn");
-    if (btn) {
-      filterContainers(btn.getAttribute("data-filter"));
-    }
-  });
-
-  applyDefaultContainerFilter();
 });

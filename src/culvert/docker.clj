@@ -1149,14 +1149,20 @@
                    new-rule-id)))))))
 
 (defn- restore-container! [id c actions]
-  (if-not (cli/container-running-strict? (:name c))
-    (do
-      (swap! state assoc-in [:containers id :status] "stopped")
-      (swap! state assoc-in [:containers id :ttydPid] nil))
-    (do
-      (restore-shell-access! id c actions)
-      (doseq [[port info] (:ports c)]
-        (restore-port-access! id c port info actions)))))
+  ;; container-running-strict? 会在容器被宿主机删除时抛出；
+  ;; 这里捕获后视为"未运行"，避免一个已消失的容器阻塞整体启动恢复。
+  (let [running? (try (cli/container-running-strict? (:name c))
+                      (catch Exception _
+                        (println (format "[docker] 容器 %s 已不存在于宿主机，标记为停止" (:name c)))
+                        false))]
+    (if-not running?
+      (do
+        (swap! state assoc-in [:containers id :status] "stopped")
+        (swap! state assoc-in [:containers id :ttydPid] nil))
+      (do
+        (restore-shell-access! id c actions)
+        (doseq [[port info] (:ports c)]
+          (restore-port-access! id c port info actions))))))
 
 (defn- throw-startup-recovery-failed! [failures cause]
   (throw (ex-info "Docker 启动恢复失败"
