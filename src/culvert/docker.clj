@@ -331,13 +331,11 @@
                               (:public-ip config)
                               (:shellPort c)))
                     ;; Domain mode: Caddy subdomain URL
-                    (if (:caddyRuleId c)
+                    (when (:caddyRuleId c)
                       (let [parsed (caddy/parse-key (:caddyRuleId c))]
-                        (if parsed
+                        (when parsed
                           (format "https://%s.%s"
-                                  (:worker parsed) (:domain parsed))
-                          ""))
-                      ""))
+                                  (:worker parsed) (:domain parsed))))))
         ports-public (reduce (fn [acc [port info]]
                                (assoc acc port
                                       {:domain (:domain info "")

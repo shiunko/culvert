@@ -232,13 +232,11 @@
                       (format "http://%s:%d"
                               (:public-ip config)
                               (:shellPort m)))
-                    (if (:caddyRuleId m)
+                    (when (:caddyRuleId m)
                       (let [parsed (caddy/parse-key (:caddyRuleId m))]
-                        (if parsed
+                        (when parsed
                           (format "https://%s.%s"
-                                  (:worker parsed) (:domain parsed))
-                          ""))
-                      ""))
+                                  (:worker parsed) (:domain parsed))))))
         ports-public (reduce (fn [acc [port info]]
                                (assoc acc port
                                       {:domain (:domain info "")

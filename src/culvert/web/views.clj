@@ -1110,7 +1110,18 @@
            [:span [:span.pf-text-muted "资源: "] [:small (str (:cpuLimit c) "C / " (:memLimit c))
                                                 (when (:gpu c) [:span.pf-text-success " " (ui.icon/icon :cpu {:size 12}) " GPU"])]]
            (when (:shellUrl c)
-             [:span [:span.pf-text-muted "Shell: "] [:a.pf-link {:href (:shellUrl c) :target "_blank" :rel "noopener noreferrer"} (ui.icon/icon :external-link {:size 12}) " " [:code (:shellToken c)]]])
+             [:span.pf-row {:style "gap:0.25rem"}
+              [:span.pf-text-muted "Shell:"]
+              [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+               {:title (:open-shell tip)
+                :data-shell-open (:shellUrl c)
+                :data-shell-user (:shellUser c)}
+               (ui.icon/icon :external-link {:size 13}) " " [:code (:shellToken c)]]
+              [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+               {:title (:copy-shell-url tip)
+                :data-shell-copy (:shellUrl c)
+                :data-shell-user (:shellUser c)}
+               (ui.icon/icon :copy {:size 13})]])
            (when (get-in c [:s3Mount :enabled])
              (let [sm (:s3Mount c)]
                [:span [:span.pf-text-muted "S3: "]
@@ -1254,7 +1265,18 @@
            [:span [:span.pf-text-muted "资源: "] [:small (str (:cpuLimit m) "C / " (:memLimit m) "MiB")
                                                 (when (:gpu m) [:span.pf-text-success " " (ui.icon/icon :cpu {:size 12}) " GPU"])]]
            (when (:shellUrl m)
-             [:span [:span.pf-text-muted "Shell: "] [:a.pf-link {:href (:shellUrl m) :target "_blank" :rel "noopener noreferrer"} (ui.icon/icon :external-link {:size 12}) " " [:code (:shellToken m)]]])]
+             [:span.pf-row {:style "gap:0.25rem"}
+              [:span.pf-text-muted "Shell:"]
+              [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+               {:title (:open-shell tip)
+                :data-shell-open (:shellUrl m)
+                :data-shell-user (:shellUser m)}
+               (ui.icon/icon :external-link {:size 13}) " " [:code (:shellToken m)]]
+              [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+               {:title (:copy-shell-url tip)
+                :data-shell-copy (:shellUrl m)
+                :data-shell-user (:shellUser m)}
+               (ui.icon/icon :copy {:size 13})]])]
 
           ;; -- Two-column grid: Credentials | Ports --
           [:div.pf-resource-card-grid

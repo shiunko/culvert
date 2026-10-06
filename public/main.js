@@ -156,8 +156,20 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!data.shellPass) {
         throw new Error("凭据响应无密码");
       }
-      return data.shellPass;
+      return data; // 返回完整对象 {shellPass, shellUser, shellUrl}
     });
+  }
+
+  // 构造带凭据的 shell URL：http://user:pass@host:port 或 https://user:pass@host
+  function buildShellUrl(baseUrl, user, pass) {
+    try {
+      var u = new URL(baseUrl);
+      u.username = encodeURIComponent(user);
+      u.password = encodeURIComponent(pass);
+      return u.toString();
+    } catch (e) {
+      return baseUrl;
+    }
   }
 
   // ============================================================
@@ -338,7 +350,7 @@ document.addEventListener("DOMContentLoaded", () => {
           copyToClipboard(input.value);
           } else {
             getCredentials(copyBtn.closest("[data-credential-endpoint]"))
-              .then(copyToClipboard)
+              .then(function (creds) { copyToClipboard(creds.shellPass); })
               .catch(() => showToast(__i18n.cannotGetPwd, "error"));
           }
       }
@@ -353,9 +365,9 @@ document.addEventListener("DOMContentLoaded", () => {
       if (input) {
         if (input.type === "password") {
           getCredentials(card)
-            .then(function (password) {
+            .then(function (creds) {
               input.type = "text";
-              input.value = password;
+              input.value = creds.shellPass;
               togglePassBtn.textContent = __i18n.hidePassword;
               togglePassBtn.title = __i18n.hidePassword;
             })
@@ -375,6 +387,44 @@ document.addEventListener("DOMContentLoaded", () => {
       if (passwordModal) {
         passwordModal.close();
       }
+    }
+
+    // 3. WebShell 打开（带凭据）
+    var shellOpenBtn = e.target.closest("[data-shell-open]");
+    if (shellOpenBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      var baseUrl = shellOpenBtn.getAttribute("data-shell-open");
+      var shellUser = shellOpenBtn.getAttribute("data-shell-user");
+      var card = shellOpenBtn.closest("[data-credential-endpoint]");
+      // 先立即开窗（用户手势），再异步填充 URL，避免弹窗拦截
+      var win = window.open("about:blank", "_blank", "width=1024,height=700,menubar=no,toolbar=no");
+      if (!win) {
+        showToast("弹窗被浏览器拦截，请允许弹出窗口后重试", "warning");
+        return;
+      }
+      getCredentials(card)
+        .then(function (creds) {
+          win.location.href = buildShellUrl(baseUrl, shellUser || creds.shellUser, creds.shellPass);
+        })
+        .catch(function () {
+          win.location.href = baseUrl;
+        });
+    }
+
+    // 4. WebShell 复制带凭据的 URL
+    var shellCopyBtn = e.target.closest("[data-shell-copy]");
+    if (shellCopyBtn) {
+      e.preventDefault();
+      var baseUrl = shellCopyBtn.getAttribute("data-shell-copy");
+      var shellUser = shellCopyBtn.getAttribute("data-shell-user");
+      var card = shellCopyBtn.closest("[data-credential-endpoint]");
+      getCredentials(card)
+        .then(function (creds) {
+          copyToClipboard(buildShellUrl(baseUrl, shellUser || creds.shellUser, creds.shellPass));
+          showToast("已复制带凭据的 Shell URL", "success");
+        })
+        .catch(function () { showToast(__i18n.cannotGetPwd, "error"); });
     }
   });
 

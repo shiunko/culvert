@@ -311,7 +311,9 @@
     :start-container "启动容器"
     :assign-container "分配容器给用户"
     :reassign-container "重新分配容器给其他用户"
-    :confirm-assign "确认分配给选中用户"}
+    :confirm-assign "确认分配给选中用户"
+    :open-shell "打开 WebShell"
+    :copy-shell-url "复制带凭据的 URL"}
 
    ;; -------------------------------------------------------- ;; :modal — Modal dialog texts ;; --------------------------------------------------------
    :modal
