@@ -4,7 +4,7 @@
             [hiccup2.core :as h]
             [culvert.web.core :as core]
             [culvert.web.views :as views]
-            [culvert.web.ws :as ws]
+            [culvert.web.sse :as sse]
             [culvert.auth :as auth]
             [culvert.authorization :as authorization]
             [culvert.caddy :as caddy]
@@ -43,8 +43,8 @@
   ([req msg activity]
    (when req
      (record-activity! req activity))
-   (ws/broadcast! (update msg :panels
-                          (fn [panels] (vec (distinct (concat panels derived-panels))))))))
+   (sse/broadcast! (update msg :panels
+                           (fn [panels] (vec (distinct (concat panels derived-panels))))))))
 
 (defn- record-failure!
   "记录一条失败活动：消息取自 `core/error-info`（与返回给客户端的提示一致），不泄露内部异常文本。"
@@ -164,13 +164,6 @@
                           stats
                           {:cpu-pct 0.0 :mem-pct 0.0 :mem-used "—" :mem-limit "—"})]))]
     (core/json-response result)))
-
-(defn- handle-ws-ticket [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)]
-    (if-not (core/csrf-validate (core/get-csrf-token req params))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (core/json-response {:ticket (core/ws-ticket-generate user)}))))
 
 (defn- handle-docker-logs-start [req]
   (let [params (core/parse-form-body req)
@@ -1095,10 +1088,6 @@
 
       (and (= request-method :post) (= uri "/logout"))
       (core/handle-logout req)
-
-      ;; WebSocket 短期连接票据
-      (and (= request-method :post) (= uri "/ws/ticket"))
-      ((core/wrap-auth handle-ws-ticket) req)
 
       ;; Dashboard Index
       (and (= request-method :get) (= uri "/"))

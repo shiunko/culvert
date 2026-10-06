@@ -20,12 +20,12 @@
 (def ^:private web-cleanup-ms 30000)
 
 ;; ============================================================
-;; WebSocket 短期票据存储（一次性消费，代替直接将 24 小时 Bearer token 写入页面）
+;; SSE 连接票据（嵌入页面，用于验证 /events 连接，支持自动重连）
 ;; ============================================================
 
-(defonce ws-ticket-store (atom {}))
-(def ^:private ws-ticket-max 1000)
-(def ^:private ws-ticket-ttl-ms 30000)
+(defonce sse-ticket-store (atom {}))
+(def ^:private sse-ticket-max 1000)
+(def ^:private sse-ticket-ttl-ms 3600000) ;; 60 分钟，覆盖页面生命周期内的自动重连
 
 (def ^:dynamic *request-security-context* nil)
 
@@ -97,32 +97,34 @@
       (get-in req [:headers "x-csrf-token"])
       (get-in req [:headers "X-CSRF-Token"])))
 
-(defn- evict-oldest-ws-ticket [store]
-  (if (> (count store) ws-ticket-max)
+(defn- evict-oldest-sse-ticket [store]
+  (if (> (count store) sse-ticket-max)
     (dissoc store (key (apply min-key (fn [[ticket entry]]
                                         [(:created-at entry) ticket])
                               store)))
     store))
 
-(defn ws-ticket-generate
-  "为已认证用户发一张 30 秒有效、一次性消费的 WebSocket 连接票据，避免将长期有效的 Bearer token 写入页面/URL。"
+(defn sse-ticket-generate
+  "为已认证用户生成 SSE 连接票据，嵌入页面 HTML。
+   票据不一次性消费（EventSource 断线后会用同一票据自动重连）。"
   [user]
   (let [ticket (random-token)
         now (System/currentTimeMillis)
         entry {:username (:username user)
                :session-id (:session-id user)
                :created-at now
-               :expires (+ now ws-ticket-ttl-ms)}]
-    (swap! ws-ticket-store #(-> % (assoc ticket entry) evict-oldest-ws-ticket))
+               :expires (+ now sse-ticket-ttl-ms)}]
+    (swap! sse-ticket-store #(-> % (assoc ticket entry) evict-oldest-sse-ticket))
     ticket))
 
-(defn ws-ticket-consume
-  "验证并立即作废一张 WebSocket 票据，返回对应的 {:username :session-id}，失败返回 nil。"
+(defn sse-ticket-validate
+  "验证 SSE 票据是否有效，返回 {:username :session-id}，失败返回 nil。
+   不消费票据，允许 EventSource 断线重连复用同一票据。"
   [ticket]
   (when-not (str/blank? ticket)
-    (let [[old-store _] (swap-vals! ws-ticket-store dissoc ticket)
-          entry (get old-store ticket)]
-      (when (and entry (<= (System/currentTimeMillis) (:expires entry)))
+    (let [entry (get @sse-ticket-store ticket)
+          now (System/currentTimeMillis)]
+      (when (and entry (<= now (:expires entry)))
         entry))))
 
 (declare rate-limit-store rate-limit-window-ms)
@@ -134,7 +136,7 @@
              (into {} (filter (fn [[_ entry]]
                                 (<= now (:expires entry)))
                               store))))
-    (swap! ws-ticket-store
+    (swap! sse-ticket-store
            (fn [store]
              (into {} (filter (fn [[_ entry]]
                                 (<= now (:expires entry)))
@@ -235,7 +237,7 @@
                                   "script-src 'self' https://unpkg.com https://cdn.jsdelivr.net; "
                                   "style-src 'self' https://cdn.jsdelivr.net; "
                                   "img-src 'self' data:; "
-                                  "connect-src 'self' ws: wss:; "
+                                  "connect-src 'self'; "
                                   "frame-ancestors 'none'; "
                                   "form-action 'self'")
    "Cache-Control" "no-store"})

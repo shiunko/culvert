@@ -11,7 +11,7 @@
 | 配置收口 | `config.clj`：配置目录、数据目录、外部命令路径只从这里取 |
 | 授权最终边界 | `auth.clj`、`authorization.clj` |
 | 转发与反代 | `forward.clj`（socat/iptables）、`caddy.clj`（原子替换配置） |
-| HTTP 面 | `web/handlers.clj` 路由分发、`web/server.clj` 传输与 WS 升级、`web/views.clj` 渲染、`web/ws.clj` 事件协议 |
+| HTTP 面 | `web/handlers.clj` 路由分发、`web/server.clj` 传输与 SSE 路由、`web/views.clj` 渲染、`web/sse.clj` SSE 推送协议 |
 | 当前生产状态 | `db.clj`（JSON 读写） |
 
 ## 结构与分层
@@ -19,7 +19,7 @@
 - 扁平领域文件（`auth`、`forward`、`docker`、`s3`、`i18n` 等）目前常把策略、atom 与 I/O 放在同一命名空间；`system` 只组合生命周期入口，不代表 application/domain 分层已经完成。
 - 六个子目录形成较明确的职责边界：`web/`、`runtime/`、`smolvm/`、`persistence/`、`workflow/`、`observability/`。
 - `persistence/` 与 `workflow/` 已实现但未接入 `system/default-dependencies`：SQLite 事务、schema、导入、saga、状态机、协调报告都不驱动生产资源。判断线上行为看 `db.clj` 与各领域 `sync-*!`，不看这两个目录。
-- `web.clj` 只是兼容门面；新代码直接 require `web.core` / `web.handlers` / `web.views` / `web.server` / `web.ws`。
+- `web.clj` 只是兼容门面；新代码直接 require `web.core` / `web.handlers` / `web.views` / `web.server` / `web.sse`。
 
 ## 依赖方向
 

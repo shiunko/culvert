@@ -284,10 +284,10 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // ============================================================
-  // WebSocket 连接状态指示灯：main.js 触发自定义事件，这里只负责渲染
+  // SSE 连接状态指示灯：main.js 触发自定义事件，这里只负责渲染
   // ============================================================
-  document.body.addEventListener("ws-status", function (evt) {
-    var indicatorEl = document.getElementById("ws-indicator");
+  document.body.addEventListener("sse-status", function (evt) {
+    var indicatorEl = document.getElementById("sse-indicator") || document.getElementById("wall-sse-indicator");
     if (indicatorEl && evt.detail && evt.detail.state) {
       indicatorEl.setAttribute("data-state", evt.detail.state);
     }

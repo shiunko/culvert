@@ -1635,6 +1635,7 @@
         username (:username user)
         is-admin? (= (:role user) "admin")
         csrf-token (core/csrf-generate)
+        sse-ticket (core/sse-ticket-generate user)
         dash (:dashboard i18n/strings)
         fm (:form i18n/strings)
         btn (:button i18n/strings)
@@ -1649,6 +1650,7 @@
        [:meta {:charset "utf-8"}]
        [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
        [:meta {:name "csrf-token" :content csrf-token}]
+       [:meta {:name "sse-ticket" :content sse-ticket}]
        [:title (:title (:app i18n/strings))]
        [:link {:href (core/asset-url "app.css") :rel "stylesheet"}]
        [:script {:src "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"}]]
@@ -1662,7 +1664,7 @@
            [:span "运维控制台"]
            [:span.pf-topbar-subtitle "Culvert"]]]
          [:div.pf-topbar-meta
-          [:span.pf-ws-indicator {:id "ws-indicator" :title "WebSocket"}]
+          [:span.pf-ws-indicator {:id "sse-indicator" :title "SSE"}]
           [:div.pf-quota-chips {:id "quota-bar" :hx-get "/panel/quota" :hx-trigger "refresh-quota from:body, every 120s" :hx-swap "innerHTML"}
            (render-quota-bar-content username user)]
           [:button.pf-cmdk {:type "button" :id "command-palette-trigger" :data-action "palette.open"
@@ -2220,13 +2222,15 @@
   (let [user (:user req)
         username (:username user)
         is-admin? (= (:role user) "admin")
-        csrf-token (core/csrf-generate)]
+        csrf-token (core/csrf-generate)
+        sse-ticket (core/sse-ticket-generate user)]
     (core/html-response
      [:html {:lang (:html-lang (:app i18n/strings)) :data-theme "dark"}
       [:head
        [:meta {:charset "utf-8"}]
        [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
        [:meta {:name "csrf-token" :content csrf-token}]
+       [:meta {:name "sse-ticket" :content sse-ticket}]
        [:title "Culvert 监控大屏"]
        [:link {:href (core/asset-url "app.css") :rel "stylesheet"}]
        [:script {:src "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"}]]
@@ -2239,7 +2243,7 @@
            [:h1.pf-kiosk-title "CULVERT MONITOR"]
            [:p.pf-kiosk-subtitle "NETWORK TOPOLOGY & STATUS OPS CENTER"]]]
          [:div.pf-kiosk-status
-          [:span.pf-ws-indicator {:id "wall-ws-indicator" :data-ws-indicator true :data-state "connecting" :title "实时数据流"}]
+          [:span.pf-ws-indicator {:id "wall-sse-indicator" :data-sse-indicator true :data-state "connecting" :title "实时数据流"}]
           [:span.pf-kiosk-status-text "实时数据流"]
           [:div.pf-kiosk-clock
            [:div.pf-kiosk-time {:id "wall-clock"} "--:--:--"]

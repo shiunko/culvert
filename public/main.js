@@ -62,10 +62,9 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // ============================================================
-  // WebSocket connection with auto-reconnect
+  // SSE connection (Server-Sent Events, replaces WebSocket)
+  // Browser handles reconnection automatically.
   // ============================================================
-  var wsReconnectDelay = 2000;
-  var wsMaxReconnectDelay = 30000;
   var panelRefreshMap = {
     "forward-tbody": "refresh-forward",
     "caddy-tbody": "refresh-caddy",
@@ -83,6 +82,50 @@ document.addEventListener("DOMContentLoaded", () => {
     "wall-topology": "refresh-wall-topology",
     "wall-alerts": "refresh-wall-alerts",
   };
+
+  function connectSSE() {
+    var ticketMeta = document.querySelector('meta[name="sse-ticket"]');
+    if (!ticketMeta) {
+      console.warn("[sse] 页面中未找到 sse-ticket meta 标签");
+      return;
+    }
+    var ticket = ticketMeta.getAttribute("content");
+    var es = new EventSource("/events?ticket=" + encodeURIComponent(ticket));
+
+    es.onopen = function () {
+      console.log("[sse] 已连接");
+      document.body.dispatchEvent(new CustomEvent("sse-status", {detail: {state: "connected"}}));
+    };
+
+    es.onmessage = function (event) {
+      try {
+        var msg = JSON.parse(event.data);
+        if (msg.event === "refresh" && msg.panels) {
+          msg.panels.forEach(function (panelId) {
+            var triggerName = panelRefreshMap[panelId];
+            if (triggerName) {
+              var el = document.getElementById(panelId);
+              if (el && el.dataset.loaded !== "false") {
+                htmx.trigger(el, triggerName);
+              }
+            }
+          });
+        } else if (msg.event === "stats" && msg.stats) {
+          updateResourceBars(msg.stats);
+        }
+      } catch (e) {
+        console.warn("[sse] 消息解析失败:", e);
+      }
+    };
+
+    es.onerror = function () {
+      // EventSource 会自动重连，无需手动处理
+      console.log("[sse] 连接中断，浏览器将自动重连");
+      document.body.dispatchEvent(new CustomEvent("sse-status", {detail: {state: "reconnecting"}}));
+    };
+  }
+
+  connectSSE();
 
   function getCsrfToken() {
     var meta = document.querySelector('meta[name="csrf-token"]');
@@ -116,89 +159,6 @@ document.addEventListener("DOMContentLoaded", () => {
       return data.shellPass;
     });
   }
-
-  function scheduleWsReconnect() {
-    console.log("[ws] " + wsReconnectDelay / 1000 + "s 后重连...");
-    document.body.dispatchEvent(new CustomEvent("ws-status", {detail: {state: "reconnecting"}}));
-    setTimeout(connectWebSocket, wsReconnectDelay);
-    wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
-  }
-
-  // 先用带 CSRF 的 POST /ws/ticket 换取一次性票据（30 秒有效），再用它升级 WebSocket；
-  // 不再使用页面内预写的长期 token（见 src/culvert/web/AGENTS.md 与 server.clj 的 /ws 分流）。
-  function fetchWsTicket() {
-    var csrf = getCsrfToken();
-    return fetch("/ws/ticket", {
-      method: "POST",
-      headers: {"Content-Type": "application/x-www-form-urlencoded", "X-CSRF-Token": csrf},
-      body: "_csrf=" + encodeURIComponent(csrf),
-      credentials: "same-origin",
-    }).then(function (res) {
-      if (!res.ok) {
-        throw new Error("票据请求失败");
-      }
-      return res.json();
-    }).then(function (data) {
-      if (!data.ticket) {
-        throw new Error("票据响应为空");
-      }
-      return data.ticket;
-    });
-  }
-
-  function openWebSocket(ticket) {
-    var protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    var wsUrl = protocol + "//" + window.location.host + "/ws?ticket=" + encodeURIComponent(ticket);
-
-    try {
-      var ws = new WebSocket(wsUrl);
-
-      ws.onopen = function () {
-        console.log("[ws] 已连接");
-        wsReconnectDelay = 2000;
-        document.body.dispatchEvent(new CustomEvent("ws-status", {detail: {state: "connected"}}));
-      };
-
-      ws.onmessage = function (event) {
-        try {
-          var msg = JSON.parse(event.data);
-          if (msg.event === "refresh" && msg.panels) {
-            msg.panels.forEach(function (panelId) {
-              var triggerName = panelRefreshMap[panelId];
-              if (triggerName) {
-                var el = document.getElementById(panelId);
-                // 尚未首次惰加载的面板（data-loaded="false"）不接受 WS 驱动的后台拉取；
-                // 用户实际切换到该 Tab 时 tabs.js 会直接拉取最新数据，无需额外补发。
-                if (el && el.dataset.loaded !== "false") {
-                  htmx.trigger(el, triggerName);
-                }
-              }
-            });
-          } else if (msg.event === "stats" && msg.stats) {
-            updateResourceBars(msg.stats);
-          }
-        } catch (e) {
-          console.warn("[ws] 消息解析失败:", e);
-        }
-      };
-
-      ws.onclose = function () {
-        scheduleWsReconnect();
-      };
-
-      ws.onerror = function () {
-        // onclose will fire after this, triggering reconnect
-      };
-    } catch (e) {
-      scheduleWsReconnect();
-    }
-  }
-
-  function connectWebSocket() {
-    fetchWsTicket().then(openWebSocket, scheduleWsReconnect);
-  }
-
-  connectWebSocket();
 
   // ============================================================
   // Listen to HTMX show-toast custom event

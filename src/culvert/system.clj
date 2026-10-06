@@ -12,7 +12,7 @@
             [culvert.smolvm.manager :as smolvm]
             [culvert.web.core :as web-core]
             [culvert.web.server :as web-server]
-            [culvert.web.ws :as ws]))
+            [culvert.web.sse :as sse]))
 
 (defn- probe-targets
   "收集需要延迟探测的 `[host port]`：仅限已启用的端口转发与反向代理目标。"
@@ -79,7 +79,7 @@
       :token-cleaner {:start! auth/start-token-cleaner! :stop! auth/stop-token-cleaner!}
       :web-cleaner {:start! web-core/start-cleaner! :stop! web-core/stop-cleaner!}
       :web-server {:start! web-server/start-server! :stop! web-server/stop-server!}
-      :stats-broadcaster {:start! ws/start-stats-broadcaster! :stop! ws/stop-stats-broadcaster!}}}))
+      :stats-broadcaster {:start! sse/start-stats-broadcaster! :stop! sse/stop-stats-broadcaster!}}}))
 
 (defn- invalid-dependencies! [message data]
   (throw (ex-info message (assoc data :type ::invalid-dependencies))))

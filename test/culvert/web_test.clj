@@ -167,52 +167,40 @@
                 :body "id=container-1"})))))))
 
 ;; ============================================================
-;; WebSocket 短期票据测试
+;; SSE 票据测试
 ;; ============================================================
 
-(deftest ws-ticket-issue-and-consume
+(deftest sse-ticket-issue-and-validate
   (reset! web/csrf-store {})
-  (reset! web/ws-ticket-store {})
+  (reset! web/sse-ticket-store {})
   (with-redefs [auth/authenticate (fn [_ _] {:username "alice"
                                              :session-id "basic:alice:1"
                                              :role "user"
                                              :quotas {}})]
-    (testing "没有 CSRF 时拒绝发票"
-      (is (= 403
-             (:status
-              (handlers/route-dispatcher
-               {:request-method :post
-                :uri "/ws/ticket"
-                :headers {"authorization" (basic-authorization "alice" "secret")}
-                :body ""})))))
-
-    (testing "携带有效 CSRF 时发票，且不写入页面的任何长期 token"
+    (testing "仪表板页面返回 200，且包含 sse-ticket meta 标签"
       (let [panel-response (handlers/route-dispatcher
                             {:request-method :get
                              :uri "/"
-                             :headers {"authorization" (basic-authorization "alice" "secret")}})
-            csrf-token (first (keys @web/csrf-store))
-            ticket-response (handlers/route-dispatcher
-                             {:request-method :post
-                              :uri "/ws/ticket"
-                              :headers {"authorization" (basic-authorization "alice" "secret")}
-                              :body (str "_csrf=" csrf-token)})
-            ticket (get (json/parse-string (:body ticket-response) true) :ticket)]
+                             :headers {"authorization" (basic-authorization "alice" "secret")}})]
         (is (= 200 (:status panel-response)))
-        (is (not (str/includes? (:body panel-response) "ws-token")))
-        (is (= 200 (:status ticket-response)))
+        (is (str/includes? (:body panel-response) "sse-ticket"))
+        (is (not (str/includes? (:body panel-response) "ws-token")))))
+
+    (testing "SSE 票据可重复验证（允许 EventSource 断线重连）"
+      (let [user {:username "alice" :session-id "basic:alice:1" :role "user"}
+            ticket (web/sse-ticket-generate user)]
         (is (string? ticket))
         (is (= 64 (count ticket)))
-
-        (testing "票据一次性消费：首次成功，二次失败"
-          (is (= {:username "alice" :session-id "basic:alice:1"}
-                 (select-keys (web/ws-ticket-consume ticket) [:username :session-id])))
-          (is (nil? (web/ws-ticket-consume ticket))))))
+        (is (= {:username "alice" :session-id "basic:alice:1"}
+               (select-keys (web/sse-ticket-validate ticket) [:username :session-id])))
+        ;; 票据不消费，第二次仍有效
+        (is (= {:username "alice" :session-id "basic:alice:1"}
+               (select-keys (web/sse-ticket-validate ticket) [:username :session-id])))))
 
     (testing "不存在、空白的票据均被拒绝"
-      (is (nil? (web/ws-ticket-consume "no-such-ticket")))
-      (is (nil? (web/ws-ticket-consume nil)))
-      (is (nil? (web/ws-ticket-consume ""))))))
+      (is (nil? (web/sse-ticket-validate "no-such-ticket")))
+      (is (nil? (web/sse-ticket-validate nil)))
+      (is (nil? (web/sse-ticket-validate ""))))))
 
 ;; ============================================================
 ;; 限流测试

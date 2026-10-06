@@ -1,27 +1,27 @@
 # Web 子树知识库（src/culvert/web/）
 
-传输与呈现边界：HTTP 路由、HTMX 局部刷新、WebSocket 推送和静态资源都在此收口。
-本目录之外的 `culvert/web.clj` 仅为兼容门面（re-export 旧公共 API）；新代码直接依赖 `web.core`、`web.handlers`、`web.views`、`web.server`、`web.ws`。
+传输与呈现边界：HTTP 路由、HTMX 局部刷新、SSE 推送和静态资源都在此收口。
+本目录之外的 `culvert/web.clj` 仅为兼容门面（re-export 旧公共 API）；新代码直接依赖 `web.core`、`web.handlers`、`web.views`、`web.server`、`web.sse`。
 
 ## 分层与请求流
 
 - `server.clj`：`start-server!`/`stop-server!`。中间件自外向内为 `request-context/wrap-request-context` → `core/wrap-security-headers` → `core/wrap-rate-limit` → 原始 handler。
-- `/ws` 特例：URI 为 `/ws` 且带 `upgrade: websocket` 头时，在 raw-handler 内分流，用 query 的 `ticket` 调 `core/ws-ticket-consume`（一次性消费），成功后再用 `auth/get-user` 重新取角色/配额，通过则进 `ws/ws-handler`，不经过 `route-dispatcher` 与 `wrap-auth`；失败返回 401。`ticket` 由 `POST /ws/ticket`（需 `wrap-auth` + CSRF）发放，30 秒有效，不再依赖预写在页面里的长期 Bearer token。
-- `core.clj`：CSRF（atom 存储，绑定 session-id/username/action，TTL 1 小时）、WebSocket 票据（`ws-ticket-store`，30 秒 TTL，与 CSRF 同模式）、IP 滑窗限流（60 秒 120 次，超限封 5 分钟，信任代理取 x-forwarded-for）、安全头与 CSP、query/form 解析、`html-response`/`json-response`/`htmx-response`、错误协议（`error-info`/`htmx-error-response`/`json-error-response`，见下面“错误协议”节）、静态文件与 `asset-url` 指纹、`wrap-auth`（Bearer token 优先，Basic 兜底，绑定 `*request-security-context*`）。
+- `/events` 特例：URI 为 `/events` 且 method=GET 时，在 raw-handler 内分流，用 query 的 `ticket` 调 `core/sse-ticket-validate`（可复用，支持 EventSource 自动重连），成功后再用 `auth/get-user` 重新取角色/配额，通过则进 `sse/sse-handler`，不经过 `route-dispatcher` 与 `wrap-auth`；失败返回 401。`ticket` 在页面渲染时由 `core/sse-ticket-generate` 生成并嵌入 `<meta name=”sse-ticket”>`，TTL 60 分钟，不一次性消费。
+- `core.clj`：CSRF（atom 存储，绑定 session-id/username/action，TTL 1 小时）、SSE 票据（`sse-ticket-store`，60 分钟 TTL，可复用）、IP 滑窗限流（60 秒 120 次，超限封 5 分钟，信任代理取 x-forwarded-for）、安全头与 CSP、query/form 解析、`html-response`/`json-response`/`htmx-response`、错误协议（`error-info`/`htmx-error-response`/`json-error-response`，见下面”错误协议”节）、静态文件与 `asset-url` 指纹、`wrap-auth`（Bearer token 优先，Basic 兜底，绑定 `*request-security-context*`）。
 - `ui/drawer.clj`、`ui/tabs.clj`：无领域依赖的纯 UI 结构生成函数（Drawer 壳、Tab 按钮），只接受已取好值的参数，不读 `config`/`i18n`/领域状态。
 - `handlers.clj`（约 1080 行）与 `views.clj`（约 1115 行）：本仓库两大复杂度热点，均超 1000 行，修改优先缩小职责，不继续堆分支。`ui/drawer.clj`/`ui/tabs.clj` 已抽走 Drawer 壳与 Tab 按钮的纯结构生成，但两个文件本身仍很小，未真正降低 `views.clj` 体积。
-- `ws.clj`：连接注册表 `channels`、`broadcast!`、`broadcast-stats!` 与 5 秒一轮的 stats 推送守护线程；客户端发来的消息当前忽略。
+- `sse.clj`：连接注册表 `channels`、`broadcast!`、`broadcast-stats!` 与 5 秒一轮的 stats 推送守护线程；通信严格单向（服务端→客户端）。
 
 ## 路由与授权
 
 - `handlers/route-dispatcher` 以 cond 逐条匹配 request-method + URI；业务路由一律包 `core/wrap-auth`，`/admin/*`、`/panel/users` 与 `/panel/host` 再包 `admin-only`（role=admin）；`/login`、`/logout`、`/health*` 免认证。只读大屏 `GET /wall` 与 `GET /` 同边界（`wrap-auth`），无任何 mutation 入口，且不加载 `tabs.js`。
-- mutation 统一节奏：`parse-form-body` → `csrf-validate`（`_csrf` 字段或 `X-CSRF-Token` 头）→ 调领域入口（端口暴露与 ttyd 日志经 `request-actor` 构造 `authorization/actor`）→ `ws/broadcast!` → `views/build-oob-response`。
+- mutation 统一节奏：`parse-form-body` → `csrf-validate`（`_csrf` 字段或 `X-CSRF-Token` 头）→ 调领域入口（端口暴露与 ttyd 日志经 `request-actor` 构造 `authorization/actor`）→ `sse/broadcast!` → `views/build-oob-response`。
 - Handler 不是唯一授权边界，领域授权（`authorization.clj` 及各 manager）是最终校验点。
 - 视图当前直接读领域 atom 与只读计数函数（如 `compute-usage`），这是存量交织而非完成态；方向是视图接收数据、只做渲染，不得在视图执行命令或发起 mutation。
 
 ## 面板刷新契约
 
-面板容器同时具备 WS 触发与 120 秒轮询兜底：`hx-get /panel/*` 加 `hx-trigger "refresh-xxx from:body, every 120s"`。
+面板容器同时具备 SSE 触发与 120 秒轮询兜底：`hx-get /panel/*` 加 `hx-trigger "refresh-xxx from:body, every 120s"`。
 `public/main.js` 的 `panelRefreshMap` 是 DOM ID 到触发事件的唯一映射，两侧必须同步改：
 
 | DOM ID | 触发事件 | 轮询端点 |
@@ -42,15 +42,15 @@
 | `wall-topology` | `refresh-wall-topology` | `/panel/wall-topology` |
 | `wall-alerts` | `refresh-wall-alerts` | `/panel/wall-alerts` |
 
-`smolvm-tbody` 已登记进 `panelRefreshMap`，handler 广播的 smolvm refresh 事件可以触发实时刷新，仍保留 120 秒轮询作为兜底。`overview-stats`/`topology-view`/`port-spectrum`/`activity-feed` 由 `handlers.clj` 的 `broadcast-mutation!` 统一附带进每次 mutation 广播的 `panels`，并被 `fragment-registry` 登记进 OOB，因此已连接客户端能实时收到刷新；`topology-view` 额外每 30 秒轮询、`port-spectrum` 每 60 秒轮询以刷新探针延迟。新增 mutation 一律用 `broadcast-mutation!`（内部自动追加派生面板），不要再直接调用 `ws/broadcast!`。
+`smolvm-tbody` 已登记进 `panelRefreshMap`，handler 广播的 smolvm refresh 事件可以触发实时刷新，仍保留 120 秒轮询作为兜底。`overview-stats`/`topology-view`/`port-spectrum`/`activity-feed` 由 `handlers.clj` 的 `broadcast-mutation!` 统一附带进每次 mutation 广播的 `panels`，并被 `fragment-registry` 登记进 OOB，因此已连接客户端能实时收到刷新；`topology-view` 额外每 30 秒轮询、`port-spectrum` 每 60 秒轮询以刷新探针延迟。新增 mutation 一律用 `broadcast-mutation!`（内部自动追加派生面板），不要再直接调用 `sse/broadcast!`。
 
 **活动记录埋点（P4）**：`handlers.clj` 的 `broadcast-mutation!` 已改签名为 `(req msg activity)`，每个 mutation handler 必须在调用处传入 `{:action :resource :summary}`；失败分支在 `catch` 里先调 `record-failure!` 再渲染错误（消息取自 `core/error-info`）。`views/all-atoms` 已纳入 `observability.activity/store`，因此 mutation 的 OOB 会自动带上 `activity-feed`。活动资源带 `:key`（`fwd-<port>-<proto>-<method>` / `caddy-<fullDomain>` / `docker-<id>` / `smolvm-<id>`）以便从活动流定位到列表行；新增 mutation 若希望可定位，请一并生成对应 `:key`。actor 必须从 `(:user req)` 显式取，不能依赖 `context/actor`。
 
 Kiosk 大屏的三个面板（`wall-kpis`/`wall-topology`/`wall-alerts`）**只登记 `panelRefreshMap` 与 `derived-panels`，不登记 `fragment-registry`**：大屏是独立只读页 `/wall`，其 DOM 不在控制台响应里，无需 OOB；WS 广播触发 `refresh-wall-*` 事件、配合 30/30/15 秒轮询即可。这样避免每次 dashboard mutation 的 OOB 里多出三段用不到的大屏标记。
 
-## WebSocket 载荷
+## SSE 事件载荷
 
-- 连接地址 `/ws?ticket=`，ticket 先经 `POST /ws/ticket` 换取（30 秒有效、一次性消费）；断线指数退避重连（2 秒起，上限 30 秒），重连时重新换票。
+- 连接地址 `GET /events?ticket=<sse-ticket>`；ticket 在页面渲染时生成并嵌入 `<meta name="sse-ticket">`，TTL 60 分钟，可复用（支持 EventSource 自动重连，无需重新换票）。
 - `{"event":"refresh","panels":["forward-tbody","quota-bar",...]}`：panels 取值须与上表 DOM ID 一致。
 - `{"event":"stats","stats":{<容器id> {:cpu-pct :mem-pct :mem-used :mem-limit}}}`：写入 `[data-container-id]` 卡片内 `.resource-usage-cell` 的 `.resource-bar-cpu`/`.resource-bar-mem` 与相邻 `.resource-bar-text`；docker 与 smolvm 合并推送；HTMX 换出 `docker-tbody` 后 main.js 再 fetch `/docker/stats` 兜底一次。
 
@@ -75,7 +75,7 @@ Kiosk 大屏的三个面板（`wall-kpis`/`wall-topology`/`wall-alerts`）**只�
 
 ## 令牌与前端耦合点
 
-- `render-dashboard` 只注入 `meta[name=csrf-token]`，不再预写任何长期 token；body 的 `hx-headers` 与 main.js 的 `htmx:configRequest` 双路携带 `X-CSRF-Token`。main.js 的 `connectWebSocket` 先 `POST /ws/ticket` 换票再开 WebSocket，重连时重新换票。
+- `render-dashboard` 注入 `meta[name=csrf-token]` 与 `meta[name=sse-ticket]`；body 的 `hx-headers` 与 main.js 的 `htmx:configRequest` 双路携带 `X-CSRF-Token`。main.js 的 `connectSSE` 读取 `meta[name=sse-ticket]` 后建立 `EventSource("/events?ticket=...")`，断线由浏览器自动重连，复用同一 ticket。
 - admin 改密是一次性 CSRF：表单按 `:action :admin/change-password` 生成，校验时 consume，成功后经 `HX-Trigger closePasswordModal` 关闭弹窗并整页 reload。
 - 密码弹窗：`hx-get /admin/password-form` 目标 `#password-modal-container`，`htmx:afterSwap` 后对 `#passwordModal` 调 `showModal()`。
 - 凭据显隐与复制依赖卡片上的 `data-resource-kind`、`data-resource-id`、`data-credential-endpoint`，以及 `data-copy`、`data-copy-pass`、`.cred-pass-input`；明文只通过带 CSRF 的 POST `/docker/credentials` 或 `/smolvm/credentials` 按需返回，不进入状态 GET、URL 或普通 DTO。
