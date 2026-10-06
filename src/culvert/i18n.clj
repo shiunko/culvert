@@ -150,6 +150,8 @@
     :assign "分配"
     :reassign "重分配"
     :start-container "启动"
+    :stop-container "停止"
+    :restart-container "重启"
     :confirm-assign "确认"
     :create-machine "创建 VM"
     :pack-machine "打包"
@@ -287,7 +289,9 @@
     :machine-port-toggled "VM 端口状态已更新"
     :machine-packed #(str "VM 已打包: " %)
     :terminal-opened #(str "容器 \"" % "\" 终端已开启")
-    :terminal-closed #(str "容器 \"" % "\" 终端已关闭")}
+    :terminal-closed #(str "容器 \"" % "\" 终端已关闭")
+    :container-stopped #(str "容器已停止: " %)
+    :container-restarted #(str "容器已重启: " %)}
 
    ;; -------------------------------------------------------- ;; :confirm — Confirmation dialogs ;; --------------------------------------------------------
    :confirm
@@ -297,7 +301,9 @@
     :delete-user #(str "确定删除用户 " % " 吗？此操作不可撤销。")
     :delete-port "确定取消该端口暴露吗？"
     :delete-machine "确定要删除该 VM 吗？所有数据将丢失！"
-    :stop-machine #(str "确定停止 VM " % " 吗？")}
+    :stop-machine #(str "确定停止 VM " % " 吗？")
+    :stop-container #(str "确定停止容器 " % " 吗？")
+    :restart-container #(str "确定重启容器 " % " 吗？")}
 
    ;; -------------------------------------------------------- ;; :tooltip — Tooltip / title attributes ;; --------------------------------------------------------
    :tooltip
@@ -316,6 +322,8 @@
     :copy-password "复制密码"
     :password-mask ""
     :start-container "启动容器"
+    :stop-container "停止容器"
+    :restart-container "重启容器"
     :assign-container "分配容器给用户"
     :reassign-container "重新分配容器给其他用户"
     :confirm-assign "确认分配给选中用户"

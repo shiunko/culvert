@@ -861,6 +861,38 @@
             (core/htmx-error-response
              (views/render-docker-tbody (:username user) true csrf-token) e)))))))
 
+(defn- handle-admin-container-action [action req]
+  (let [params (core/parse-form-body req)
+        csrf-token (core/get-csrf-token req params)
+        name (:name params)
+        actor (request-actor req)
+        activity {:action (case action
+                            :start   :docker/container-start
+                            :stop    :docker/container-stop
+                            :restart :docker/container-restart)
+                  :resource {:kind "container" :id name :key (str "docker-" name)}}]
+    (if-not (core/csrf-validate csrf-token)
+      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
+      (try
+        (docker/host-container-action! name action actor)
+        (broadcast-mutation! req
+                             {:event "refresh" :panels ["docker-tbody"]}
+                             activity)
+        (let [user (:user req)
+              toast-msg (case action
+                          :start   ((:container-started (:toast i18n/strings)) name)
+                          :stop    ((:container-stopped (:toast i18n/strings)) name)
+                          :restart ((:container-restarted (:toast i18n/strings)) name))]
+          (core/htmx-response
+           (views/render-docker-tbody (:username user) true csrf-token)
+           toast-msg
+           "success"))
+        (catch Exception e
+          (record-failure! req activity e)
+          (let [user (:user req)]
+            (core/htmx-error-response
+             (views/render-docker-tbody (:username user) true csrf-token) e)))))))
+
 ;; ============================================================
 ;; Main Router Dispatcher
 ;; ============================================================
@@ -1083,6 +1115,15 @@
 
       (and (= request-method :post) (= uri "/admin/containers/terminal/credentials"))
       ((core/wrap-auth (admin-only handle-admin-terminal-credentials)) req)
+
+      (and (= request-method :post) (= uri "/admin/containers/start"))
+      ((core/wrap-auth (admin-only (partial handle-admin-container-action :start))) req)
+
+      (and (= request-method :post) (= uri "/admin/containers/stop"))
+      ((core/wrap-auth (admin-only (partial handle-admin-container-action :stop))) req)
+
+      (and (= request-method :post) (= uri "/admin/containers/restart"))
+      ((core/wrap-auth (admin-only (partial handle-admin-container-action :restart))) req)
 
       ;; Health checks (no auth required)
       (and (= request-method :get) (contains? #{"/health" "/health/live"} uri))

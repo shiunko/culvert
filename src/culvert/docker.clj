@@ -968,6 +968,27 @@
       (swap! state assoc-in [:containers c-id] container)
       (save-entries!))))
 
+(defn host-container-action!
+  "管理员对任意宿主机容器执行 :start / :stop / :restart。
+   未登记容器只执行 CLI 命令；已登记容器同步更新应用状态的 :status 字段（不管 ttyd）。"
+  [container-name action actor]
+  (require-mutations-enabled!)
+  (authorization/require-admin! actor (:no-permission-container (:validation i18n/strings)))
+  (case action
+    :start   (cli/start-container container-name)
+    :stop    (cli/stop-container container-name)
+    :restart (cli/restart-container container-name)
+    (throw (ex-info "不支持的操作" {:type ::unsupported-action :action action})))
+  ;; 已登记容器同步状态
+  (let [new-status (cond (= action :start) "running"
+                         (= action :stop)  "stopped"
+                         ;; restart：inspect 取真实状态
+                         :else (try (if (cli/container-running-strict? container-name) "running" "stopped")
+                                    (catch Exception _ "stopped")))]
+    (when-let [managed (find-managed-container container-name)]
+      (swap! state assoc-in [:containers (:id managed) :status] new-status)
+      (save-entries!))))
+
 (defn start-container!
   "启动已授权且已停止的容器，并恢复 ttyd 与 Caddy 规则。"
   ([id actor]

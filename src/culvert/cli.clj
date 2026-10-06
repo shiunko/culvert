@@ -127,6 +127,14 @@
   (log/info (format "启动容器: %s" container-name-or-id))
   (exec-cmd "start" container-name-or-id))
 
+(defn stop-container [container-name-or-id]
+  (log/info (format "停止容器: %s" container-name-or-id))
+  (exec-cmd "stop" container-name-or-id))
+
+(defn restart-container [container-name-or-id]
+  (log/info (format "重启容器: %s" container-name-or-id))
+  (exec-cmd "restart" container-name-or-id))
+
 (defn get-container-info
   "Returns container details from docker inspect for adopt purpose."
   [container-name-or-id]

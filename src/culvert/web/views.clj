@@ -1233,7 +1233,7 @@
          :title (:terminal-not-running (:validation i18n/strings))}
         (ui.icon/icon :terminal {:size 14})]
        :else
-       [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+       [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-primary
         {:type "button" :title (:open-terminal (:tooltip i18n/strings))
          :hx-post "/admin/containers/terminal/open"
          :hx-target "#terminal-modal-container"
@@ -1268,7 +1268,8 @@
             (map (fn [hc]
                    (if-let [full (get managed-map (:appContainerId hc))]
                      (assoc full :_webshell (:webshell hc) :_host-state (:state hc))
-                     (assoc hc :_unmanaged true :_host-state (:state hc))))
+                     (assoc hc :_unmanaged true :_host-state (:state hc)
+                            :_webshell (:webshell hc))))
                  sorted))
           ;; 普通用户：仅托管容器
           (docker/get-containers username false))
@@ -1283,29 +1284,56 @@
        (for [[idx c] (map-indexed vector docker-entries)]
          (if (:_unmanaged c)
            ;; ---- 宿主机未托管容器（无 app 记录） ----
-           [:div.card.pf-resource-card
-            {:data-container-id (:id c)
-             :data-resource-kind "docker"
-             :data-tab "docker"}
-            [:div.pf-resource-card-header
-             [:div.pf-row-wrap
-              [:span.pf-badge.pf-badge-ghost (str "#" (inc idx))]
-              [:code {:style "font-weight:700"} (:name c)]
-              [:span.pf-badge.pf-badge-warning "未登记"]
-              (resource-status-badge (if (= (:state c) "running") "running" "stopped") sts)]
-             [:div.pf-row
-              [:button.pf-btn.pf-btn-ghost.pf-btn-xs
-               {:title (:view-logs tip)
-                :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id c)) "UTF-8"))
-                :hx-target "#log-panel-container"
-                :hx-swap "innerHTML"}
-               (ui.icon/icon :file-text {:size 14})]
-              (admin-terminal-btns c csrf-token tip btn)]]
-            [:div.pf-resource-card-meta
-             [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image c)]]
-             (when-let [cid (:id c)]
-               [:span [:span.pf-text-muted "ID: "]
-                [:code (subs cid 0 (min 12 (count cid)))]])]]
+           (let [running? (= (:_host-state c) "running")
+                 host-vals (mutation-vals csrf-token {:name (:name c)})]
+             [:div.card.pf-resource-card
+              {:data-container-id (:id c)
+               :data-resource-kind "docker"
+               :data-tab "docker"}
+              [:div.pf-resource-card-header
+               [:div.pf-row-wrap
+                [:span.pf-badge.pf-badge-ghost (str "#" (inc idx))]
+                [:code {:style "font-weight:700"} (:name c)]
+                [:span.pf-badge.pf-badge-warning "未登记"]
+                (resource-status-badge (if running? "running" "stopped") sts)]
+               [:div.pf-row
+                [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                 {:title (:view-logs tip)
+                  :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id c)) "UTF-8"))
+                  :hx-target "#log-panel-container"
+                  :hx-swap "innerHTML"}
+                 (ui.icon/icon :file-text {:size 14})]
+                (admin-terminal-btns c csrf-token tip btn)
+                (if running?
+                  (list
+                   [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                    {:title (:restart-container tip)
+                     :hx-post "/admin/containers/restart"
+                     :hx-target "#docker-tbody"
+                     :hx-swap "innerHTML"
+                     :hx-confirm ((:restart-container cfm) (:name c))
+                     :hx-vals host-vals}
+                    (ui.icon/icon :refresh-cw {:size 14})]
+                   [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-warning
+                    {:title (:stop-container tip)
+                     :hx-post "/admin/containers/stop"
+                     :hx-target "#docker-tbody"
+                     :hx-swap "innerHTML"
+                     :hx-confirm ((:stop-container cfm) (:name c))
+                     :hx-vals host-vals}
+                    (ui.icon/icon :square {:size 14})])
+                  [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
+                   {:title (:start-container tip)
+                    :hx-post "/admin/containers/start"
+                    :hx-target "#docker-tbody"
+                    :hx-swap "innerHTML"
+                    :hx-vals host-vals}
+                   (ui.icon/icon :play {:size 14})])]]
+              [:div.pf-resource-card-meta
+               [:span [:span.pf-text-muted "镜像: "] [:code.pf-break-all (:image c)]]
+               (when-let [cid (:id c)]
+                 [:span [:span.pf-text-muted "ID: "]
+                  [:code (subs cid 0 (min 12 (count cid)))]])]])
 
            ;; ---- 托管容器（完整 card） ----
            [:div.card.pf-resource-card {:data-container-id (:id c)
