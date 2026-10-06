@@ -924,14 +924,20 @@
                  :hx-include "closest tr"
                  :hx-vals (mutation-vals csrf-token {:name (:name hc)})}
                 (:confirm-assign btn)]))
-            (when (and (:assignedUser hc) (= (:state hc) "exited"))
-              [:button.pf-btn.pf-btn-outline.pf-btn-success.pf-btn-xs.pf-btn-block
-               {:title (:start-container tip)
-                :hx-post "/docker/start"
-                :hx-target "#docker-tbody"
-                :hx-swap "innerHTML"
-                :hx-vals (mutation-vals csrf-token {:id (:appContainerId hc)})}
-               (:start-container btn)])]]])))))
+            (when (:appContainerId hc)
+              [:div {:style "display:flex;gap:0.25rem;margin-top:0.25rem"}
+               [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                {:title (:view-logs tip)
+                 :data-log-container (:appContainerId hc)}
+                (ui.icon/icon :file-text {:size 13})]
+               (when (= (:state hc) "exited")
+                 [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
+                  {:title (:start-container tip)
+                   :hx-post "/docker/start"
+                   :hx-target "#docker-tbody"
+                   :hx-swap "innerHTML"
+                   :hx-vals (mutation-vals csrf-token {:id (:appContainerId hc)})}
+                  (ui.icon/icon :play {:size 13})])])]]])))))
 
 (defn render-forwards-tbody [username is-admin? csrf-token]
   (let [entries (forward/get-entries username is-admin?)]

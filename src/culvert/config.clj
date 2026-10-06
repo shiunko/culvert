@@ -168,10 +168,10 @@
       :socat-restart-base-delay-ms 1000
       :container-cli container-cli
       :container-cli-path (configured-command (:containerCliPath raw) container-cli)
-      :docker-mutations-enabled (true? (:dockerMutationsEnabled raw))
-      :smolvm-mutations-enabled (true? (:smolvmMutationsEnabled raw))
+      :docker-mutations-enabled (not= false (:dockerMutationsEnabled raw))
+      :smolvm-mutations-enabled (not= false (:smolvmMutationsEnabled raw))
       :ttyd-path (configured-command (:ttydPath raw) "ttyd")
-      :ttyd-enabled (true? (:ttydEnabled raw))
+      :ttyd-enabled (not= false (:ttydEnabled raw))
       :ttyd-port-start (or (get-in raw [:ttydPortRange :start]) 17680)
       :ttyd-port-end (or (get-in raw [:ttydPortRange :end]) 17999)
       :ttyd-max-clients (let [v (:ttydMaxClients raw)] (if (nil? v) 1 (int v)))

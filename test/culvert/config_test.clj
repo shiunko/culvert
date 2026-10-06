@@ -23,10 +23,10 @@
     (is (contains? config/config :container-cli))
     (is (contains? config/config :db-path))
     (is (contains? config/config :s3))
-    (is (false? (:docker-mutations-enabled config/config)))
-    (is (false? (:smolvm-mutations-enabled config/config)))
+    (is (true? (:docker-mutations-enabled config/config)))
+    (is (true? (:smolvm-mutations-enabled config/config)))
     (is (false? (get-in config/config [:s3 :enabled])))
-    (is (false? (:ttyd-enabled config/config)))
+    (is (true? (:ttyd-enabled config/config)))
     (is (contains? config/config :ttyd-max-clients)))
 
   (testing "默认配额值仍然可用"
@@ -81,24 +81,24 @@
                               (config/validate-config raw))))
       (finally (delete-tree! root)))))
 
-(deftest mutation-features-require-explicit-enablement
+(deftest mutation-features-default-enabled-explicit-false-disables
   (let [paths (config/resolve-paths {})
         defaults (config/build-config {:port 10092 :publicIp "127.0.0.1"} paths)
-        enabled (config/build-config {:port 10092
-                                      :publicIp "127.0.0.1"
-                                      :dockerMutationsEnabled true
-                                      :smolvmMutationsEnabled true
-                                      :s3 {:enabled true}}
-                                     paths)]
-    (testing "变更功能默认关闭"
-      (is (false? (:docker-mutations-enabled defaults)))
-      (is (false? (:smolvm-mutations-enabled defaults)))
+        disabled (config/build-config {:port 10092
+                                       :publicIp "127.0.0.1"
+                                       :dockerMutationsEnabled false
+                                       :smolvmMutationsEnabled false
+                                       :ttydEnabled false}
+                                      paths)]
+    (testing "变更功能默认开启"
+      (is (true? (:docker-mutations-enabled defaults)))
+      (is (true? (:smolvm-mutations-enabled defaults)))
       (is (false? (get-in defaults [:s3 :enabled])))
-      (is (false? (:ttyd-enabled defaults))))
-    (testing "显式配置为 true 时开启变更功能"
-      (is (true? (:docker-mutations-enabled enabled)))
-      (is (true? (:smolvm-mutations-enabled enabled)))
-      (is (true? (get-in enabled [:s3 :enabled]))))))
+      (is (true? (:ttyd-enabled defaults))))
+    (testing "显式配置为 false 时关闭变更功能"
+      (is (false? (:docker-mutations-enabled disabled)))
+      (is (false? (:smolvm-mutations-enabled disabled)))
+      (is (false? (:ttyd-enabled disabled))))))
 
 (deftest path-search-does-not-use-a-shell
   (let [root (temp-dir)
