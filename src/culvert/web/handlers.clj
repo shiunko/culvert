@@ -54,6 +54,34 @@
                                :severity :error
                                :summary (:message (core/error-info e)))))
 
+(defn- mutation-ctx
+  "从请求构建 mutation 上下文：已解析的 params、用户信息与 CSRF token。"
+  [req]
+  (let [params (core/parse-form-body req)
+        user (:user req)]
+    {:params params
+     :user user
+     :username (:username user)
+     :is-admin (= (:role user) "admin")
+     :csrf (core/get-csrf-token req params)}))
+
+(defn- oob-mutation!
+  "统一的 OOB mutation 流程：CSRF 校验 → 域操作 → 广播 → OOB 响应。
+   op-fn 接收 ctx，执行域操作。success 为成功提示字符串，或接收域操作返回值的函数（返回 [msg type]）。"
+  [req tbody activity panels op-fn success]
+  (let [ctx (mutation-ctx req)
+        before (views/snapshot-atoms views/all-atoms)]
+    (if-not (core/csrf-validate (:csrf ctx))
+      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
+      (try
+        (let [result (op-fn ctx)]
+          (broadcast-mutation! req {:event "refresh" :panels panels} activity)
+          (let [[msg type] (if (fn? success) (success result) [success "success"])]
+            (views/build-oob-response tbody ctx before msg type)))
+        (catch Exception e
+          (record-failure! req activity e)
+          (views/build-oob-error-response tbody ctx before e))))))
+
 ;; ============================================================
 ;; Panel Refresh Handlers (polling + WebSocket triggered)
 ;; ============================================================
@@ -199,269 +227,132 @@
 ;; --- Forward Handlers ---
 
 (defn- handle-add-forward [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :forward/add
                   :resource {:kind "forward" :id (str (:port params) "/" (:protocol params)) :key (str "fwd-" (:port params) "-" (:protocol params) "-" (:method params))}
                   :summary (str "新增端口转发 :" (:port params) "/" (:protocol params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [ip (:ip params)
-              port (:port params)
-              to-port (:toPort params)
-              protocol (:protocol params)
-              method (:method params)
-              remark (:remark params)]
-          (forward/add-forward! port protocol ip to-port method remark (:username user))
-          (broadcast-mutation! req {:event "refresh" :panels ["forward-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "forward-tbody" ctx before
-                                    (:forward-added (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "forward-tbody" ctx before e))))))
+    (oob-mutation! req "forward-tbody" activity ["forward-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (forward/add-forward! (:port params) (:protocol params)
+                                           (:ip params) (:toPort params)
+                                           (:method params) (:remark params)
+                                           (:username ctx)))
+                   (:forward-added (:toast i18n/strings)))))
 
 (defn- handle-remove-forward [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :forward/remove
                   :resource {:kind "forward" :id (str (:port params) "/" (:protocol params)) :key (str "fwd-" (:port params) "-" (:protocol params) "-" (:method params))}
                   :summary (str "删除端口转发 :" (:port params) "/" (:protocol params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [port (:port params)
-              protocol (:protocol params)
-              method (:method params)]
-          (forward/remove-forward! port protocol method (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["forward-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "forward-tbody" ctx before
-                                    (:forward-removed (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "forward-tbody" ctx before e))))))
+    (oob-mutation! req "forward-tbody" activity ["forward-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (forward/remove-forward! (:port params) (:protocol params) (:method params) (:username ctx) (:is-admin ctx)))
+                   (:forward-removed (:toast i18n/strings)))))
 
 (defn- handle-toggle-forward [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :forward/toggle
                   :resource {:kind "forward" :id (str (:port params) "/" (:protocol params)) :key (str "fwd-" (:port params) "-" (:protocol params) "-" (:method params))}
                   :summary (str "切换端口转发 :" (:port params) "/" (:protocol params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [port (:port params)
-              protocol (:protocol params)
-              method (:method params)]
-          (forward/toggle-forward! port protocol method (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["forward-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "forward-tbody" ctx before
-                                    (:forward-toggled (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "forward-tbody" ctx before e))))))
+    (oob-mutation! req "forward-tbody" activity ["forward-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (forward/toggle-forward! (:port params) (:protocol params) (:method params) (:username ctx) (:is-admin ctx)))
+                   (:forward-toggled (:toast i18n/strings)))))
 
 (defn- handle-edit-remark [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :forward/edit-remark
                   :resource {:kind "forward" :id (str (:port params) "/" (:protocol params)) :key (str "fwd-" (:port params) "-" (:protocol params) "-" (:method params))}
                   :summary (str "修改端口转发备注 :" (:port params) "/" (:protocol params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [port (:port params)
-              protocol (:protocol params)
-              method (:method params)
-              remark (:remark params)]
-          (forward/update-remark! port protocol method remark (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["forward-tbody"]} activity)
-          (views/build-oob-response "forward-tbody" ctx before
-                                    (:remark-updated (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "forward-tbody" ctx before e))))))
+    (oob-mutation! req "forward-tbody" activity ["forward-tbody"]
+                   (fn [ctx]
+                     (forward/update-remark! (:port params) (:protocol params) (:method params) (:remark params) (:username ctx) (:is-admin ctx)))
+                   (:remark-updated (:toast i18n/strings)))))
 
 ;; --- Caddy Handlers ---
 
 (defn- handle-caddy-add [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :caddy/add
                   :resource {:kind "caddy" :id (str (:worker params) "." (:domain params)) :key (str "caddy-" (:worker params) "." (:domain params))}
                   :summary (str "新增反向代理 " (:worker params) "." (:domain params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [domain (:domain params)
-              worker (:worker params)
-              target (:target params)
-              remark (:remark params)]
-          (caddy/add-rule! domain worker target remark (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["caddy-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "caddy-tbody" ctx before
-                                    (:caddy-added (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "caddy-tbody" ctx before e))))))
+    (oob-mutation! req "caddy-tbody" activity ["caddy-tbody" "quota-bar"]
+                   (fn [_ctx]
+                     (caddy/add-rule! (:domain params) (:worker params) (:target params) (:remark params) (request-actor req)))
+                   (:caddy-added (:toast i18n/strings)))))
 
 (defn- handle-caddy-remove [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :caddy/remove
                   :resource {:kind "caddy" :id (str (:worker params) "." (:domain params)) :key (str "caddy-" (:worker params) "." (:domain params))}
                   :summary (str "删除反向代理 " (:worker params) "." (:domain params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [domain (:domain params)
-              worker (:worker params)]
-          (caddy/remove-rule! domain worker (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["caddy-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "caddy-tbody" ctx before
-                                    (:caddy-removed (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "caddy-tbody" ctx before e))))))
+    (oob-mutation! req "caddy-tbody" activity ["caddy-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (caddy/remove-rule! (:domain params) (:worker params) (:username ctx) (:is-admin ctx)))
+                   (:caddy-removed (:toast i18n/strings)))))
 
 (defn- handle-caddy-toggle [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :caddy/toggle
                   :resource {:kind "caddy" :id (str (:worker params) "." (:domain params)) :key (str "caddy-" (:worker params) "." (:domain params))}
                   :summary (str "切换反向代理 " (:worker params) "." (:domain params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [domain (:domain params)
-              worker (:worker params)]
-          (caddy/toggle-rule! domain worker (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["caddy-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "caddy-tbody" ctx before
-                                    (:caddy-toggled (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "caddy-tbody" ctx before e))))))
+    (oob-mutation! req "caddy-tbody" activity ["caddy-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (caddy/toggle-rule! (:domain params) (:worker params) (:username ctx) (:is-admin ctx)))
+                   (:caddy-toggled (:toast i18n/strings)))))
 
 (defn- handle-caddy-edit-remark [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :caddy/edit-remark
                   :resource {:kind "caddy" :id (str (:worker params) "." (:domain params)) :key (str "caddy-" (:worker params) "." (:domain params))}
                   :summary (str "修改反向代理备注 " (:worker params) "." (:domain params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [domain (:domain params)
-              worker (:worker params)
-              remark (:remark params)]
-          (caddy/update-remark! domain worker remark (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["caddy-tbody"]} activity)
-          (views/build-oob-response "caddy-tbody" ctx before
-                                    (:remark-updated (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "caddy-tbody" ctx before e))))))
+    (oob-mutation! req "caddy-tbody" activity ["caddy-tbody"]
+                   (fn [ctx]
+                     (caddy/update-remark! (:domain params) (:worker params) (:remark params) (:username ctx) (:is-admin ctx)))
+                   (:remark-updated (:toast i18n/strings)))))
 
 ;; --- Docker Handlers ---
 
 (defn- handle-docker-create [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :docker/create
                   :resource {:kind "container" :id (:image params)}
                   :summary (str "创建容器（镜像 " (:image params) "）")}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [image (:image params)
-              cpu (:cpuLimit params)
-              mem (:memLimit params)
-              gpu? (boolean (:gpu params))
-              s3-config (when (seq (:s3Bucket params))
-                          {:endpoint (:s3Endpoint params)
-                           :bucket (:s3Bucket params)
-                           :accessKey (:s3AccessKey params)
-                           :secretKey (:s3SecretKey params)
-                           :region (:s3Region params)})
-              container (docker/create-container! (:username user) image cpu mem s3-config gpu?)]
-          (broadcast-mutation! req {:event "refresh" :panels ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]} activity)
-          (if (:s3Warning container)
-            (views/build-oob-response "docker-tbody" ctx before
-                                      ((:container-created-s3-warn (:toast i18n/strings)) (:s3Warning container)) "warning")
-            (views/build-oob-response "docker-tbody" ctx before
-                                      ((:container-created (:toast i18n/strings)) (:name container)) "success")))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "docker-tbody" ctx before e))))))
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]
+                   (fn [ctx]
+                     (let [s3-config (when (seq (:s3Bucket params))
+                                       {:endpoint (:s3Endpoint params)
+                                        :bucket (:s3Bucket params)
+                                        :accessKey (:s3AccessKey params)
+                                        :secretKey (:s3SecretKey params)
+                                        :region (:s3Region params)})]
+                       (docker/create-container! (:username ctx) (:image params)
+                                                 (:cpuLimit params) (:memLimit params)
+                                                 s3-config (boolean (:gpu params)))))
+                   (fn [container]
+                     (if (:s3Warning container)
+                       [((:container-created-s3-warn (:toast i18n/strings)) (:s3Warning container)) "warning"]
+                       [((:container-created (:toast i18n/strings)) (:name container)) "success"])))))
 
 (defn- handle-docker-kill [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :docker/kill
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "删除容器 " (:id params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)]
-          (docker/kill-container! id (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]} activity)
-          (views/build-oob-response "docker-tbody" ctx before
-                                    (:container-deleted (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "docker-tbody" ctx before e))))))
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]
+                   (fn [ctx]
+                     (docker/kill-container! (:id params) (:username ctx) (:is-admin ctx)))
+                   (:container-deleted (:toast i18n/strings)))))
 
 (defn- handle-docker-status [req]
   (let [id (last (str/split (:uri req) #"/"))
@@ -489,77 +380,37 @@
          {:shellPass (docker/get-shell-pass id (:username user) is-admin?)})))))
 
 (defn- handle-docker-port-add [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :docker/port-add
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "暴露容器端口 :" (:port params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)
-              port (:port params)
-              remark (:remark params)]
-          (docker/expose-port! id port remark (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["docker-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (views/build-oob-response "docker-tbody" ctx before
-                                    ((:port-exposed (:toast i18n/strings)) port) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "docker-tbody" ctx before e))))))
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody"]
+                   (fn [_ctx]
+                     (docker/expose-port! (:id params) (:port params) (:remark params) (request-actor req)))
+                   ((:port-exposed (:toast i18n/strings)) (:port params)))))
 
 (defn- handle-docker-port-remove [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :docker/port-remove
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "取消容器端口 :" (:port params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)
-              port (:port params)]
-          (docker/unexpose-port! id port (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["docker-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (views/build-oob-response "docker-tbody" ctx before
-                                    ((:port-unexposed (:toast i18n/strings)) port) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "docker-tbody" ctx before e))))))
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody"]
+                   (fn [_ctx]
+                     (docker/unexpose-port! (:id params) (:port params) (request-actor req)))
+                   ((:port-unexposed (:toast i18n/strings)) (:port params)))))
 
 (defn- handle-docker-port-toggle [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :docker/port-toggle
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "切换容器端口 :" (:port params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)
-              port (:port params)]
-          (docker/toggle-port! id port (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["docker-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "docker-tbody" ctx before
-                                    (:port-toggled (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "docker-tbody" ctx before e))))))
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar"]
+                   (fn [_ctx]
+                     (docker/toggle-port! (:id params) (:port params) (request-actor req)))
+                   (:port-toggled (:toast i18n/strings)))))
 
 (defn- handle-docker-s3-test [req]
   (let [params (core/parse-form-body req)
@@ -587,27 +438,15 @@
              :body (str (h/html [:span.pf-text-error "" message]))}))))))
 
 (defn- handle-docker-start [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :docker/start
                   :resource {:kind "container" :id (:id params) :key (str "docker-" (:id params))}
                   :summary (str "启动容器 " (:id params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)]
-          (docker/start-container! id (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]} activity)
-          (views/build-oob-response "docker-tbody" ctx before
-                                    ((:container-started (:toast i18n/strings)) id) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "docker-tbody" ctx before e))))))
+    (oob-mutation! req "docker-tbody" activity ["docker-tbody" "quota-bar" "caddy-tbody" "admin-containers-tbody"]
+                   (fn [ctx]
+                     (docker/start-container! (:id params) (:username ctx) (:is-admin ctx)))
+                   ((:container-started (:toast i18n/strings)) (:id params)))))
 
 ;; --- SmolVM Handlers ---
 
@@ -619,108 +458,58 @@
      :body (str (views/render-smolvm-tbody (:username user) is-admin? (core/csrf-generate)))}))
 
 (defn- handle-smolvm-create [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/create
                   :resource {:kind "smolvm" :id (:image params)}
                   :summary (str "创建微虚机（镜像 " (:image params) "）")}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [image (:image params)
-              cpu (:cpuLimit params)
-              mem (:memLimit params)
-              net? (boolean (:netEnabled params))
-              ssh-agent? (boolean (:sshAgent params))
-              allow-hosts (when-let [raw (:allowHosts params)]
-                            (vec (remove str/blank? (str/split-lines raw))))
-              allow-cidrs (when-let [raw (:allowCidrs params)]
-                            (vec (remove str/blank? (str/split-lines raw))))
-              opts {:net? net?
-                    :ssh-agent? ssh-agent?
-                    :allow-hosts (or allow-hosts [])
-                    :allow-cidrs (or allow-cidrs [])}
-              machine (smolvm/create-machine! (:username user) image cpu mem opts)]
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    ((:machine-created (:toast i18n/strings)) (:name machine)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (let [allow-hosts (when-let [raw (:allowHosts params)]
+                                         (vec (remove str/blank? (str/split-lines raw))))
+                           allow-cidrs (when-let [raw (:allowCidrs params)]
+                                         (vec (remove str/blank? (str/split-lines raw))))
+                           opts {:net? (boolean (:netEnabled params))
+                                 :ssh-agent? (boolean (:sshAgent params))
+                                 :allow-hosts (or allow-hosts [])
+                                 :allow-cidrs (or allow-cidrs [])}]
+                       (smolvm/create-machine! (:username ctx) (:image params)
+                                               (:cpuLimit params) (:memLimit params) opts)))
+                   (fn [machine]
+                     [((:machine-created (:toast i18n/strings)) (:name machine)) "success"]))))
 
 (defn- handle-smolvm-kill [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/kill
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "删除微虚机 " (:id params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)]
-          (smolvm/kill-machine! id (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    (:machine-deleted (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar" "caddy-tbody"]
+                   (fn [ctx]
+                     (smolvm/kill-machine! (:id params) (:username ctx) (:is-admin ctx)))
+                   (:machine-deleted (:toast i18n/strings)))))
 
 (defn- handle-smolvm-start [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/start
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "启动微虚机 " (:id params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)]
-          (smolvm/start-machine! id (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    ((:machine-started (:toast i18n/strings)) id) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar" "caddy-tbody"]
+                   (fn [ctx]
+                     (smolvm/start-machine! (:id params) (:username ctx) (:is-admin ctx)))
+                   ((:machine-started (:toast i18n/strings)) (:id params)))))
 
 (defn- handle-smolvm-stop [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/stop
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "停止微虚机 " (:id params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)]
-          (smolvm/stop-machine! id (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    ((:machine-stopped (:toast i18n/strings)) id) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar"]
+                   (fn [ctx]
+                     (smolvm/stop-machine! (:id params) (:username ctx) (:is-admin ctx)))
+                   ((:machine-stopped (:toast i18n/strings)) (:id params)))))
 
 (defn- handle-smolvm-status [req]
   (let [id (last (str/split (:uri req) #"/"))
@@ -748,100 +537,48 @@
          {:shellPass (smolvm/get-shell-pass id (:username user) is-admin?)})))))
 
 (defn- handle-smolvm-port-add [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/port-add
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "暴露微虚机端口 :" (:port params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)
-              port (:port params)
-              remark (:remark params)]
-          (smolvm/expose-port! id port remark (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    ((:machine-port-exposed (:toast i18n/strings)) port) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar" "caddy-tbody"]
+                   (fn [_ctx]
+                     (smolvm/expose-port! (:id params) (:port params) (:remark params) (request-actor req)))
+                   ((:machine-port-exposed (:toast i18n/strings)) (:port params)))))
 
 (defn- handle-smolvm-port-remove [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/port-remove
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "取消微虚机端口 :" (:port params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)
-              port (:port params)]
-          (smolvm/unexpose-port! id port (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar" "caddy-tbody"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    ((:machine-port-unexposed (:toast i18n/strings)) port) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar" "caddy-tbody"]
+                   (fn [_ctx]
+                     (smolvm/unexpose-port! (:id params) (:port params) (request-actor req)))
+                   ((:machine-port-unexposed (:toast i18n/strings)) (:port params)))))
 
 (defn- handle-smolvm-port-toggle [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/port-toggle
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "切换微虚机端口 :" (:port params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)
-              port (:port params)]
-          (smolvm/toggle-port! id port (request-actor req))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody" "quota-bar"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    (:machine-port-toggled (:toast i18n/strings)) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody" "quota-bar"]
+                   (fn [_ctx]
+                     (smolvm/toggle-port! (:id params) (:port params) (request-actor req)))
+                   (:machine-port-toggled (:toast i18n/strings)))))
 
 (defn- handle-smolvm-pack [req]
-  (let [params (core/parse-form-body req)
-        user (:user req)
-        ctx {:username (:username user)
-             :is-admin (= (:role user) "admin")
-             :csrf (core/get-csrf-token req params)
-             :user user}
-        before (views/snapshot-atoms views/all-atoms)
+  (let [ctx (mutation-ctx req)
+        params (:params ctx)
         activity {:action :smolvm/pack
                   :resource {:kind "smolvm" :id (:id params) :key (str "smolvm-" (:id params))}
                   :summary (str "打包微虚机 " (:id params))}]
-    (if-not (core/csrf-validate (:csrf ctx))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [id (:id params)]
-          (smolvm/pack-machine! id "/tmp" (:username user) (:is-admin ctx))
-          (broadcast-mutation! req {:event "refresh" :panels ["smolvm-tbody"]} activity)
-          (views/build-oob-response "smolvm-tbody" ctx before
-                                    ((:machine-packed (:toast i18n/strings)) id) "success"))
-        (catch Exception e
-          (record-failure! req activity e)
-          (views/build-oob-error-response "smolvm-tbody" ctx before e))))))
+    (oob-mutation! req "smolvm-tbody" activity ["smolvm-tbody"]
+                   (fn [ctx]
+                     (smolvm/pack-machine! (:id params) "/tmp" (:username ctx) (:is-admin ctx)))
+                   ((:machine-packed (:toast i18n/strings)) (:id params)))))
 
 ;; --- Admin Container Management Handlers ---
 
