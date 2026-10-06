@@ -786,6 +786,26 @@ dialog.pf-modal::backdrop {
 }
 
 /* ============================================================
+ * 容器日志面板（原生 <dialog>，见 views.clj render-log-panel）
+ * ============================================================ */
+
+.pf-log-view {
+  margin: 0;
+  padding: var(--pf-space-2);
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--pf-bg-2);
+  border: 1px solid var(--pf-border);
+  border-radius: var(--pf-radius-md);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--pf-text);
+}
+
+/* ============================================================
  * 骨架屏（Tab 首次惰加载占位，见 docs/12 §14.3/§14.4）
  * ============================================================ */
 

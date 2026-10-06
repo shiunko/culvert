@@ -156,7 +156,11 @@
     :start-machine "启动"
     :stop-machine "停止"
     :add-volume "添加挂载"
-    :remove-volume "移除"}
+    :remove-volume "移除"
+    :close "关闭"
+    :open-terminal "开启终端"
+    :open-terminal-window "打开终端"
+    :stop-terminal "关闭终端"}
 
    ;; -------------------------------------------------------- ;; :table — Table column headers ;; --------------------------------------------------------
    :table
@@ -281,7 +285,9 @@
     :machine-port-exposed #(str "VM 端口 " % " 已暴露")
     :machine-port-unexposed #(str "VM 端口 " % " 已取消暴露")
     :machine-port-toggled "VM 端口状态已更新"
-    :machine-packed #(str "VM 已打包: " %)}
+    :machine-packed #(str "VM 已打包: " %)
+    :terminal-opened #(str "容器 \"" % "\" 终端已开启")
+    :terminal-closed #(str "容器 \"" % "\" 终端已关闭")}
 
    ;; -------------------------------------------------------- ;; :confirm — Confirmation dialogs ;; --------------------------------------------------------
    :confirm
@@ -301,6 +307,7 @@
     :delete "删除"
     :delete-container "删除容器"
     :view-logs "查看日志"
+    :log-refresh "立即刷新日志"
     :refresh-logs "刷新日志"
     :unexpose "取消暴露"
     :copy-username "复制用户名"
@@ -311,11 +318,20 @@
     :start-container "启动容器"
     :assign-container "分配容器给用户"
     :reassign-container "重新分配容器给其他用户"
-    :confirm-assign "确认分配给选中用户"}
+    :confirm-assign "确认分配给选中用户"
+    :open-terminal "打开容器终端"
+    :stop-terminal "关闭容器终端"
+    :terminal-credentials "查看终端凭据"}
 
    ;; -------------------------------------------------------- ;; :modal — Modal dialog texts ;; --------------------------------------------------------
+   ;; 日志面板与应用内弹窗共用；终端凭据只在开启时一次性展示。
    :modal
-   {:change-password-title "修改用户密码"}
+   {:change-password-title "修改用户密码"
+    :log-title "容器日志"
+    :log-follow "跟随"
+    :terminal-title "容器终端"
+    :terminal-url "终端地址"
+    :terminal-hint "浏览器会弹出登录框；请用下面的用户名与密码登录（凭据属于本次终端会话）。"}
 
    ;; -------------------------------------------------------- ;; :s3 — S3 related display texts ;; --------------------------------------------------------
    :s3
@@ -376,6 +392,12 @@
     :container-already-assigned "该容器已分配给其他用户"
     :user-not-selected "请选择分配目标用户"
     :container-already-running "容器已在运行中"
+
+    :terminal-not-running "容器未运行，无法打开终端"
+    :terminal-shell-unavailable "容器内未找到可用 shell，无法打开终端"
+    :terminal-exposure-disabled "当前部署未开启终端曝光：需配置域名，或显式开启 ttydSessionPublic"
+    :terminal-session-limit #(str "管理员终端会话数已达上限 (" (:used %) "/" (:limit %) ")")
+    :terminal-session-not-found "终端会话不存在"
 
     :smolvm-image-not-allowed #(str "VM 镜像 \"" (:image %) "\" 不在允许列表中。可用镜像: " (:allowed %))
     :smolvm-cpu-exceeded #(str "VM CPU 不能超过 " % " 核")

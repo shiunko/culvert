@@ -832,6 +832,21 @@ dialog.pf-modal::backdrop {
   padding: 0;
   margin: 0;
 }
+.pf-log-view {
+  margin: 0;
+  padding: var(--pf-space-2);
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--pf-bg-2);
+  border: 1px solid var(--pf-border);
+  border-radius: var(--pf-radius-md);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--pf-text);
+}
 .pf-skeleton {
   background: linear-gradient(90deg, var(--pf-bg-2) 25%, rgb(255 255 255 / 0.06) 37%, var(--pf-bg-2) 63%);
   background-size: 400% 100%;

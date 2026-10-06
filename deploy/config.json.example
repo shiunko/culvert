@@ -1,5 +1,5 @@
 {
-  "_comment": "复制到 /etc/culvert/config.json，将权限限制为 0600；如初始化需要凭据，请仅在本地添加。切勿提交凭据。",
+  "_comment": "复制到 /etc/culvert/config.json，将权限限制为 0600；如初始化需要凭据，请仅在本地添加。切勿提交凭据。ttydSessionPublic 仅控制管理员容器终端在 IP 模式下的曝光：默认 false 时 ttyd 只绑 loopback，需运维显式开启才会绑定 listenAddress。",
   "port": 10092,
   "publicIp": "127.0.0.1",
   "containerCli": "podman",
@@ -7,6 +7,8 @@
   "allowedImages": [],
   "dockerMutationsEnabled": false,
   "smolvmMutationsEnabled": false,
+  "ttydEnabled": false,
+  "ttydSessionPublic": false,
   "s3": {
     "enabled": false
   }
