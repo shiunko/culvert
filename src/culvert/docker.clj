@@ -311,7 +311,8 @@
 (def ^:private webshell-shell-candidates ["/bin/bash" "/bin/sh"])
 
 (defn- require-webshell-exposure!
-  "域模式走 Caddy 子域；IP 模式默认只绑 loopback，需要显式开启 ttydSessionPublic。"
+  "域模式走 Caddy 子域；IP 模式默认开启曝光（绑定 publicIp），
+   仅在 ttydSessionPublic: false 时阻止。"
   []
   (require-ttyd-enabled!)
   (when (and (:ip-mode config) (not (:ttyd-session-public config false)))

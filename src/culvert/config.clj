@@ -57,7 +57,6 @@
 (def ^:private default-raw-config
   {:port 10092
    :publicIp "127.0.0.1"
-   :listenAddress "127.0.0.1"
    :caddyDomains []})
 
 (defn resolve-paths
@@ -144,7 +143,8 @@
          domains (normalize-domains raw)
          raw-s3 (or (:s3 raw) {})]
      {:port (if (string? (:port raw)) (Integer/parseInt (:port raw)) (or (:port raw) 10092))
-      :listen-address (or (:listenAddress raw) "127.0.0.1")
+      ;; listenAddress 缺省时继承 publicIp；历史环境只需配置 publicIp 即可
+      :listen-address (or (:listenAddress raw) (:publicIp raw) "127.0.0.1")
       :public-ip (:publicIp raw)
       :auth-user (:authUser raw)
       :auth-pass (:authPass raw)
@@ -172,9 +172,9 @@
       :smolvm-mutations-enabled (not= false (:smolvmMutationsEnabled raw))
       :ttyd-path (configured-command (:ttydPath raw) "ttyd")
       :ttyd-enabled (not= false (:ttydEnabled raw))
-      ;; 管理员容器终端在 IP 模式下默认只绑 loopback（远端浏览器不可达）；
-      ;; 只有显式开启本项时才绑定 :listen-address，把曝光决定留给运维。
-      :ttyd-session-public (true? (:ttydSessionPublic raw))
+      ;; IP 模式下终端曝光默认开启（绑定 :listen-address = publicIp）；
+      ;; 仅在显式配置 ttydSessionPublic: false 时关闭。
+      :ttyd-session-public (not= false (:ttydSessionPublic raw))
       :ttyd-port-start (or (get-in raw [:ttydPortRange :start]) 17680)
       :ttyd-port-end (or (get-in raw [:ttydPortRange :end]) 17999)
       :ttyd-max-clients (let [v (:ttydMaxClients raw)] (if (nil? v) 1 (int v)))

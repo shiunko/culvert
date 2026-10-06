@@ -94,11 +94,32 @@
       (is (true? (:docker-mutations-enabled defaults)))
       (is (true? (:smolvm-mutations-enabled defaults)))
       (is (false? (get-in defaults [:s3 :enabled])))
-      (is (true? (:ttyd-enabled defaults))))
+      (is (true? (:ttyd-enabled defaults)))
+      (is (true? (:ttyd-session-public defaults))))
     (testing "显式配置为 false 时关闭变更功能"
       (is (false? (:docker-mutations-enabled disabled)))
       (is (false? (:smolvm-mutations-enabled disabled)))
       (is (false? (:ttyd-enabled disabled))))))
+
+(deftest ttyd-session-public-explicit-false-disables
+  (testing "ttydSessionPublic: false 时终端曝光关闭"
+    (let [paths (config/resolve-paths {})
+          cfg   (config/build-config {:port 10092
+                                      :publicIp "127.0.0.1"
+                                      :ttydSessionPublic false}
+                                     paths)]
+      (is (false? (:ttyd-session-public cfg)))))
+  (testing "listenAddress 缺省时继承 publicIp"
+    (let [paths (config/resolve-paths {})
+          cfg   (config/build-config {:port 10092 :publicIp "10.0.0.5"} paths)]
+      (is (= "10.0.0.5" (:listen-address cfg)))))
+  (testing "listenAddress 显式覆盖 publicIp"
+    (let [paths (config/resolve-paths {})
+          cfg   (config/build-config {:port 10092
+                                      :publicIp "10.0.0.5"
+                                      :listenAddress "0.0.0.0"}
+                                     paths)]
+      (is (= "0.0.0.0" (:listen-address cfg))))))
 
 (deftest path-search-does-not-use-a-shell
   (let [root (temp-dir)
