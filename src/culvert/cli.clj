@@ -141,6 +141,36 @@
       (log/warn (format "获取容器信息失败: %s" (.getMessage e)))
       {:image "unknown"})))
 
+(defn shell-available-in-container?
+  "探测容器内是否可执行指定 shell（不分配 TTY），失败返回 false。"
+  [container-name-or-id shell]
+  (try
+    (zero? (:exit (process/run [cli-path "exec" (str container-name-or-id) (str shell) "-c" "true"])))
+    (catch Exception _
+      false)))
+
+(defn container-exists?
+  "判断容器是否存在。仅当 CLI 明确报告目标不存在时返回 false；
+   CLI 不可用等其它错误抛 ::inspect-failed，不用 false 掩盖不确定状态。"
+  [container-name-or-id]
+  (try
+    (let [res (process/run [cli-path "inspect" "--format" "{{.Id}}" (str container-name-or-id)])]
+      (if (zero? (:exit res))
+        true
+        (let [message (str/lower-case (str (:err res) " " (:out res)))]
+          (if (str/includes? message "no such")
+            false
+            (throw (ex-info (str "查询容器失败: " (str/trim (str (:err res))))
+                            {:type ::inspect-failed
+                             :target (str container-name-or-id)}))))))
+    (catch clojure.lang.ExceptionInfo e
+      (throw e))
+    (catch Exception e
+      (throw (ex-info (str "查询容器失败: " (.getMessage e))
+                      {:type ::inspect-failed
+                       :target (str container-name-or-id)}
+                      e)))))
+
 (defn list-containers [& [filter-str]]
   (let [args (cond-> ["ps" "-a" "--no-trunc" "--format" "{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}"]
                filter-str (conj "--filter" filter-str))]
@@ -156,40 +186,52 @@
         (log/warn (format "列出容器失败: %s" (.getMessage e)))
         []))))
 
+(defn inspect-container-details
+  "严格读取容器的 id、名称、镜像与状态，供需要在执行动作前确认目标仍存在的场景使用。
+   容器不存在、标识歧义或 CLI 不可用时抛 ::inspect-failed，不返回降级结果。"
+  [container-name-or-id]
+  (try
+    (let [raw (inspect-container container-name-or-id
+                                 "{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.State.Status}}")
+          [id name image state] (str/split raw #"\|" 4)]
+      {:id (str/trim (or id ""))
+       :name (str/replace (str/trim (or name "")) #"^/+" "")
+       :image (str/trim (or image ""))
+       :state (str/trim (or state ""))})
+    (catch Exception e
+      (throw (ex-info (str "读取容器信息失败: " (.getMessage e))
+                      {:type ::inspect-failed
+                       :target container-name-or-id}
+                      e)))))
 (defn get-container-logs
-  "Returns recent container logs. opts supports :tail (default 200) and :since (e.g. '10m')."
+  "读取容器最近日志，opts 支持 :tail（默认 200）与 :since（如 \"10m\"）。
+
+   容器日志按标准输出/标准错误两路分流，只取其中一路会丢内容，因此这里合并两路返回。
+   读取失败（容器不存在、运行时不可用、非零退出）抛 ::logs-failed，由调用方决定如何展示。"
   [container-name-or-id & [opts]]
-  (let [tail (or (:tail opts) 200)]
-    (try
-      (let [args (cond-> ["logs" "--tail" (str tail) "--timestamps"]
-                   (:since opts) (conj "--since" (:since opts))
-                   true (conj container-name-or-id))
-            res (process/run (into [cli-path] (map str) args))]
-        (if (zero? (:exit res))
-          (or (str/trim (:out res)) (str/trim (:err res)) "(无日志输出)")
-          (let [stderr (str/trim (:err res))]
-            (str "获取日志失败: " (if (str/blank? stderr) (:out res) stderr)))))
-      (catch Exception e
-        (str "获取日志异常: " (.getMessage e))))))
+  (let [tail (or (:tail opts) 200)
+        args (cond-> ["logs" "--tail" (str tail) "--timestamps"]
+               (:since opts) (conj "--since" (:since opts))
+               true (conj container-name-or-id))
+        res (try
+              (process/run (into [cli-path] (map str) args))
+              (catch Exception e
+                (throw (ex-info (str "读取容器日志失败: " (.getMessage e))
+                                {:type ::logs-failed
+                                 :target container-name-or-id}
+                                e))))
+        out (str/trim (:out res))
+        err (str/trim (:err res))
+        text (str/join "\n" (remove str/blank? [out err]))]
+    (if (zero? (:exit res))
+      (if (str/blank? text) "(无日志输出)" text)
+      (throw (ex-info (str "读取容器日志失败: " (if (str/blank? err) out err))
+                      {:type ::logs-failed
+                       :target container-name-or-id
+                       :exit (:exit res)})))))
 
 (defn get-ttyd-exec-args [container-name shell-path]
   [cli-path "exec" "-it" container-name shell-path])
-
-;; --- Log Streaming Support (for real-time log tail via SSE) ---
-
-(defn stream-container-logs
-  "Returns a process adapter handle for streaming logs via 'docker logs -f'.
-   The caller is responsible for reading from :out and terminating the process."
-  [container-name-or-id & [opts]]
-  (let [tail (or (:tail opts) 200)
-        args (cond-> ["logs" "--tail" (str tail) "--timestamps" "-f"]
-               (:since opts) (conj "--since" (:since opts))
-               true (conj container-name-or-id))]
-    (try
-      (process/spawn (into [cli-path] (map str) args) {:out :stream :err :string})
-      (catch Exception e
-        (log/error (format "启动日志流失败: %s" (.getMessage e)))
-        nil))))
 
 ;; --- GPU Support ---
 

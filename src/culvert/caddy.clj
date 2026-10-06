@@ -383,10 +383,10 @@
 (defn add-rule!
   "添加管理员批准的任意目标代理规则。"
   [domain worker target remark actor]
-  (let [{:keys [username admin?]} (canonical-caddy-actor actor)]
-    (when-not admin?
-      (throw (ex-info "仅管理员可添加任意目标代理规则"
-                      {:type ::admin-required :username username})))
+  (let [canonical (canonical-caddy-actor actor)
+        {:keys [username]} canonical]
+    ;; 任意目标代理属管理员专属能力；该规则由 authorization 统一提供，不在本命名空间内联。
+    (authorization/require-admin! canonical "仅管理员可添加任意目标代理规则")
     (add-rule-for-owner! domain worker target remark username)))
 
 (defn add-managed-rule!

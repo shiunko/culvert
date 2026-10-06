@@ -11,7 +11,8 @@
             [culvert.smolvm.manager :as smolvm]
             [culvert.web.core :as web]
             [culvert.web.handlers :as handlers]
-            [culvert.web.views :as views]))
+            [culvert.web.views :as views]
+            [culvert.web.sse :as sse]))
 
 ;; ============================================================
 ;; CSRF token 测试
@@ -517,6 +518,174 @@
         (is (= 200 (:status response)))
         (is (str/includes? (:body response) "pf-host"))
         (is (str/includes? (:body response) "端口池"))))))
+
+;; ============================================================
+;; 容器日志面板：同源读取与授权（应用内替代 ttyd 日志弹窗）
+;; ============================================================
+
+(defn- admin-user []
+  {:username "admin" :session-id "basic:admin:1" :role "admin" :quotas {}})
+
+(deftest container-logs-panel-renders-for-authorized-target
+  (testing "管理员可读取未受管宿主机容器的日志，且日志文本被放进面板"
+    (let [original @docker/state]
+      (try
+        (reset! docker/state {:containers {} :used-ports #{} :ttyd-procs {}})
+        (with-redefs [auth/authenticate (fn [_ _] (admin-user))
+                      docker/read-logs (fn [target actor opts]
+                                         (is (= "host-box" target))
+                                         (is (= "admin" (:username actor)))
+                                         (is (= 200 (:tail opts)))
+                                         {:source :host :id "host-box" :name "host-box"
+                                          :state "exited" :text "line-1\nline-2"})]
+          (let [response (handlers/route-dispatcher
+                          {:request-method :get
+                           :uri "/docker/logs"
+                           :query-string "target=host-box"
+                           :headers {"authorization" (basic-authorization "admin" "secret")}})]
+            (is (= 200 (:status response)))
+            (is (str/includes? (:body response) "logModal"))
+            (is (str/includes? (:body response) "line-1"))
+            (is (str/includes? (:body response) "/docker/logs/content"))))
+        (finally
+          (reset! docker/state original)))))
+  (testing "无权目标返回面板内提示，不返回 5xx（保证 htmx 能换入）"
+    (let [original @docker/state]
+      (try
+        (reset! docker/state {:containers {} :used-ports #{} :ttyd-procs {}})
+        (with-redefs [auth/authenticate (fn [_ _] {:username "alice"
+                                                   :session-id "basic:alice:1"
+                                                   :role "user"
+                                                   :quotas {}})
+                      docker/read-logs (fn [& _] (throw (Exception. "无权操作此容器")))]
+          (let [response (handlers/route-dispatcher
+                          {:request-method :get
+                           :uri "/docker/logs"
+                           :query-string "target=other-box"
+                           :headers {"authorization" (basic-authorization "alice" "secret")}})]
+            (is (= 200 (:status response)))
+            (is (str/includes? (:body response) "无权操作此容器"))))
+        (finally
+          (reset! docker/state original))))))
+
+(deftest container-logs-content-returns-pre-only
+  (testing "轮询端点只返回日志正文，保留外层 #log-stream 的 hx-* 属性"
+    (with-redefs [auth/authenticate (fn [_ _] (admin-user))
+                  docker/read-logs (fn [& _] {:name "box" :state "running" :text "tail-text"})]
+      (let [response (handlers/route-dispatcher
+                      {:request-method :get
+                       :uri "/docker/logs/content"
+                       :query-string "target=box&tail=1000"
+                       :headers {"authorization" (basic-authorization "admin" "secret")}})]
+        (is (= 200 (:status response)))
+        (is (str/includes? (:body response) "tail-text"))
+        (is (not (str/includes? (:body response) "logModal")))))))
+
+(deftest removed-log-ttyd-routes-are-gone
+  (testing "旧 ttyd 日志弹窗路由已下线"
+    (with-redefs [auth/authenticate (fn [_ _] (admin-user))]
+      (is (= 404
+             (:status (handlers/route-dispatcher
+                       {:request-method :post
+                        :uri "/docker/logs/start"
+                        :headers {"authorization" (basic-authorization "admin" "secret")}}))))
+      (is (= 404
+             (:status (handlers/route-dispatcher
+                       {:request-method :post
+                        :uri "/docker/logs/stop"
+                        :headers {"authorization" (basic-authorization "admin" "secret")}})))))))
+
+;; ============================================================
+;; 管理员容器终端：路由授权、CSRF 与凭据面板
+;; ============================================================
+
+(defn- admin-terminal-request [method uri csrf-token]
+  (cond-> {:request-method method
+           :uri uri
+           :headers {"authorization" (basic-authorization "admin" "secret")}}
+    csrf-token (assoc :body (str "target=host-box&_csrf=" csrf-token))))
+
+(deftest admin-terminal-routes-are-admin-only
+  (testing "普通用户被拒绝，且不进入领域入口"
+    (let [called (atom 0)]
+      (with-redefs [auth/authenticate (fn [_ _] {:username "alice"
+                                                 :session-id "basic:alice:1"
+                                                 :role "user"
+                                                 :quotas {}})
+                    docker/open-webshell! (fn [& _] (swap! called inc))]
+        (is (= 403 (:status (handlers/route-dispatcher
+                             {:request-method :post
+                              :uri "/admin/containers/terminal/open"
+                              :headers {"authorization" (basic-authorization "alice" "secret")}}))))
+        (is (= 403 (:status (handlers/route-dispatcher
+                             {:request-method :post
+                              :uri "/admin/containers/terminal/close"
+                              :headers {"authorization" (basic-authorization "alice" "secret")}}))))
+        (is (= 403 (:status (handlers/route-dispatcher
+                             {:request-method :post
+                              :uri "/admin/containers/terminal/credentials"
+                              :headers {"authorization" (basic-authorization "alice" "secret")}}))))
+        (is (zero? @called))))))
+
+(deftest admin-terminal-open-requires-csrf
+  (testing "管理员缺 CSRF token 时被拒绝"
+    (let [called (atom 0)]
+      (with-redefs [auth/authenticate (fn [_ _] (admin-user))
+                    docker/open-webshell! (fn [& _] (swap! called inc))]
+        (is (= 403 (:status (handlers/route-dispatcher
+                             (admin-terminal-request :post "/admin/containers/terminal/open" nil)))))
+        (is (zero? @called))))))
+
+(deftest admin-terminal-open-returns-credential-panel
+  (testing "开启成功返回凭据面板（明文只在此片段出现）并广播列表刷新"
+    (reset! web/csrf-store {})
+    (let [broadcasts (atom [])
+          recorded (atom [])]
+      (with-redefs [auth/authenticate (fn [_ _] (admin-user))
+                    docker/open-webshell! (fn [target actor]
+                                            (is (= "host-box" target))
+                                            (is (true? (:admin? actor)))
+                                            {:name "host-box" :status "running"
+                                             :url "http://term-x.example:17680"
+                                             :user "dev_ab" :passMasked "●●●"})
+                    docker/reveal-webshell-credentials (fn [& _] {:user "dev_ab" :pass "pw-123"})
+                    sse/broadcast! (fn [msg] (swap! broadcasts conj msg))
+                    activity/record! (fn [event] (swap! recorded conj event))]
+        (handlers/route-dispatcher {:request-method :get
+                                    :uri "/admin/containers"
+                                    :headers {"authorization" (basic-authorization "admin" "secret")}})
+        (let [csrf-token (first (keys @web/csrf-store))
+              response (handlers/route-dispatcher
+                        (admin-terminal-request :post "/admin/containers/terminal/open" csrf-token))]
+          (is (= 200 (:status response)))
+          (is (str/includes? (:body response) "terminalModal"))
+          (is (str/includes? (:body response) "pw-123"))
+          (is (some #(= [:docker/terminal-open] [(:action %)]) @recorded))
+          (is (some #(some #{"admin-containers-tbody"} (:panels %)) @broadcasts)))))))
+
+(deftest admin-terminal-close-refreshes-container-table
+  (testing "关闭终端返回管理表片段并记录活动"
+    (reset! web/csrf-store {})
+    (let [closed (atom 0)
+          recorded (atom [])]
+      (with-redefs [auth/authenticate (fn [_ _] (admin-user))
+                    docker/get-all-host-containers (fn [] [])
+                    docker/close-webshell! (fn [target _actor]
+                                             (swap! closed inc)
+                                             (is (= "host-box" target))
+                                             {:status "ok"})
+                    sse/broadcast! (fn [_] nil)
+                    activity/record! (fn [event] (swap! recorded conj event))]
+        (handlers/route-dispatcher {:request-method :get
+                                    :uri "/admin/containers"
+                                    :headers {"authorization" (basic-authorization "admin" "secret")}})
+        (let [csrf-token (first (keys @web/csrf-store))
+              response (handlers/route-dispatcher
+                        (admin-terminal-request :post "/admin/containers/terminal/close" csrf-token))]
+          (is (= 200 (:status response)))
+          (is (str/includes? (:body response) "pf-row-actions"))
+          (is (= 1 @closed))
+          (is (some #(= [:docker/terminal-close] [(:action %)]) @recorded)))))))
 
 ;; ============================================================
 ;; 总览：端口频谱测试（数值升序排序、范围端口、预留池与渲染）

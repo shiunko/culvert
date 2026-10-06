@@ -18,9 +18,10 @@
 ;; ============================================================
 
 (defonce state (atom {:containers {}   ; id -> 容器
+                      :webshells {}      ; 容器名 -> 管理员终端会话记录（只存数据，不存进程）
+                      :webshell-procs {} ; 容器名 -> {:pid pid :proc proc}
                       :used-ports #{}
-                      :ttyd-procs {}      ; id -> {:pid pid :proc proc}
-                      :log-ttyd-procs {}})) ; id -> {:pid :proc :port}
+                      :ttyd-procs {}})) ; id -> {:pid pid :proc proc}
 
 (def legacy-user (or (:auth-user config) "admin"))
 
@@ -162,7 +163,7 @@
 ;; --- DB Operations ---
 
 (defn load-entries! []
-  (let [data (db/read-json (:docker-db-path config) {:containers {}})
+  (let [data (db/read-json (:docker-db-path config) {:containers {} :webshells {}})
         containers (reduce (fn [acc [k c]]
                              (let [k-str (if (keyword? k) (name k) k)
                                    c-updated (cond-> c
@@ -170,8 +171,15 @@
                                                true (assoc :userId (or (:userId c) legacy-user)))]
                                (assoc acc k-str c-updated)))
                            {}
-                           (:containers data {}))]
-    (swap! state assoc :containers containers)
+                           (:containers data {}))
+        webshells (reduce (fn [acc [k ws]]
+                            (let [k-str (if (keyword? k) (name k) k)]
+                              (assoc acc k-str
+                                     ;; 进程不跨重启存活，恢复前的状态一律视为已停止。
+                                     (assoc ws :ttydPid nil :status "stopped"))))
+                          {}
+                          (:webshells data {}))]
+    (swap! state assoc :containers containers :webshells webshells)
     (doseq [c (vals containers)]
       (when (:shellPort c)
         (swap! state update :used-ports conj (:shellPort c)))
@@ -179,10 +187,15 @@
       (doseq [[_port info] (:ports c)]
         (when (:hostPort info)
           (swap! state update :used-ports conj (:hostPort info)))))
-    (println (format "[docker] 已加载 %d 个容器记录" (count (:containers @state))))))
+    (doseq [ws (vals webshells)]
+      (when (:port ws)
+        (swap! state update :used-ports conj (:port ws))))
+    (println (format "[docker] 已加载 %d 个容器记录、%d 个终端会话"
+                     (count (:containers @state)) (count (:webshells @state))))))
 
 (defn save-entries! []
-  (db/write-json (:docker-db-path config) {:containers (:containers @state)}))
+  (db/write-json (:docker-db-path config) {:containers (:containers @state)
+                                           :webshells (:webshells @state)}))
 
 ;; --- ttyd Process Controls ---
 
@@ -240,7 +253,7 @@
         entry (get-in @state [:ttyd-procs id])]
     (and entry (process/alive? (:proc entry)))))
 
-;; --- Log ttyd Process Controls ---
+;; --- 日志读取（受管容器按所有权，宿主机容器按管理员） ---
 
 (defn- require-container-access! [container-id actor]
   (authorization/require-actor! actor)
@@ -252,71 +265,324 @@
      (:no-permission-container (:validation i18n/strings)))
     c))
 
-(defn- stop-log-ttyd-process! [container-id]
-  (when-let [entry (get-in @state [:log-ttyd-procs container-id])]
+(defn- find-managed-container
+  "按应用记录 id 或容器名匹配受管容器，未命中返回 nil。"
+  [target]
+  (let [t (str target)]
+    (or (get-in @state [:containers t])
+        (some #(when (= (:name %) t) %) (vals (:containers @state))))))
+
+(defn resolve-log-target
+  "解析日志目标：受管容器按所有权校验（管理员可看全部），宿主机上其他容器只有管理员可看。
+   返回 {:source :managed|:host :id :name :state}；目标不存在或无权时抛异常。"
+  [target actor]
+  (authorization/require-actor! actor)
+  (if-let [c (find-managed-container target)]
+    (let [managed (require-container-access! (:id c) actor)]
+      {:source :managed :id (:id managed) :name (:name managed) :state (:status managed)})
+    (do
+      ;; 宿主机上的未知容器没有可校验的所有者，只开放给管理员。
+      (authorization/require-admin! actor (:no-permission-container (:validation i18n/strings)))
+      (let [info (try
+                   (cli/inspect-container-details target)
+                   (catch Exception e
+                     (throw (ex-info (:container-not-found (:validation i18n/strings))
+                                     {:type ::container-not-found :target (str target)}
+                                     e))))]
+        {:source :host :id (:id info) :name (:name info) :state (:state info)}))))
+
+(defn read-logs
+  "读取可访问容器的最近日志，opts 支持 :tail（默认 200）。
+   日志读取不需要 PTY，也不再依赖 ttyd：容器已停止（exited）时同样可读。"
+  ([target actor] (read-logs target actor {}))
+  ([target actor opts]
+   (let [resolved (resolve-log-target target actor)]
+     (assoc resolved
+            :text (cli/get-container-logs (:name resolved) {:tail (:tail opts 200)})))))
+
+;; --- 管理员容器终端（持久 webshell） ---
+;;
+;; 与受管容器记录里的所有者 shell 是两套东西：
+;; - 所有者 shell 随容器记录生命周期，凭据属于容器所有者，本模块不动它；
+;; - 管理员终端是独立注册表 `:webshells`，对宿主机上任意容器开放，
+;;   只要容器存在且运行就保持存活（不随浏览器关闭或空闲回收），容器停止、
+;;   被删除（含 CLI 直接删除）或管理员显式关闭时结束。
+
+(def ^:private webshell-shell-candidates ["/bin/bash" "/bin/sh"])
+
+(defn- require-webshell-exposure!
+  "域模式走 Caddy 子域；IP 模式默认只绑 loopback，需要显式开启 ttydSessionPublic。"
+  []
+  (require-ttyd-enabled!)
+  (when (and (:ip-mode config) (not (:ttyd-session-public config false)))
+    (throw (ex-info (:terminal-exposure-disabled (:validation i18n/strings))
+                    {:type ::terminal-exposure-disabled}))))
+
+(defn- webshell-bind-address []
+  (if (:ip-mode config) (:listen-address config) "127.0.0.1"))
+
+(defn- webshell-url [ws]
+  (if (:ip-mode config)
+    (str "http://" (:public-ip config) ":" (:port ws))
+    (when-let [parsed (caddy/parse-key (:caddyRuleId ws))]
+      ;; Caddyfile 里受管规则固定是 http://<worker>.<domain>，不能写成 https。
+      (str "http://" (:worker parsed) "." (:domain parsed)))))
+
+(defn- webshell-alive? [ws]
+  (let [entry (get-in @state [:webshell-procs (:name ws)])]
+    (boolean (and ws entry (:proc entry) (process/alive? (:proc entry))))))
+
+(defn- to-public-webshell [ws]
+  (when ws
+    {:name (:name ws)
+     :status (cond
+               (and (= (:status ws) "running") (webshell-alive? ws)) "running"
+               (= (:status ws) "running") "stopped"
+               :else (:status ws))
+     :shell (:shell ws)
+     :user (:user ws)
+     :passMasked "●●●●●●●●●●●●"
+     :url (when (= (:status ws) "running") (webshell-url ws))
+     :createdBy (:createdBy ws)
+     :createdAt (:createdAt ws)}))
+
+(defn webshell-for
+  "按容器名或应用记录 id 查公开终端信息，未开启返回 nil。"
+  [target]
+  (let [t (str target)
+        managed (find-managed-container t)
+        name (if managed (:name managed) t)]
+    (to-public-webshell (get-in @state [:webshells name]))))
+
+(defn resolve-shell-target
+  "解析终端目标：宿主机上任意容器（含未受管容器）均可，只有管理员能调用。
+   返回 {:name :containerId :image :state}；容器不存在抛 ::container-not-found。"
+  [target actor]
+  (authorization/require-actor! actor)
+  (authorization/require-admin! actor (:no-permission-container (:validation i18n/strings)))
+  (let [managed (find-managed-container target)
+        name (if managed (:name managed) (str target))
+        info (try
+               (cli/inspect-container-details name)
+               (catch Exception e
+                 (throw (ex-info (:container-not-found (:validation i18n/strings))
+                                 {:type ::container-not-found :target (str target)}
+                                 e))))]
+    {:name (:name info)
+     :containerId (:id info)
+     :image (:image info)
+     :state (:state info)}))
+
+(defn- resolve-webshell-shell [name image]
+  (let [candidates (->> (concat [(get-in config [:images-map image :entry])]
+                                [(:default-shell config)]
+                                webshell-shell-candidates)
+                        (remove str/blank?)
+                        distinct)]
+    (or (some #(when (cli/shell-available-in-container? name %) %) candidates)
+        (throw (ex-info (:terminal-shell-unavailable (:validation i18n/strings))
+                        {:type ::terminal-shell-unavailable
+                         :containerName name})))))
+
+(defn- add-webshell-caddy-rule [ws]
+  (if (:ip-mode config)
+    nil
+    (let [domain (:caddy-domain config)
+          worker (str "term-" (generate-token) (generate-token))
+          target (str "http://127.0.0.1:" (:port ws))]
+      (caddy/add-managed-rule! domain worker target
+                               (str "terminal:" (:name ws)) (:createdBy ws))
+      (caddy/build-key domain worker))))
+
+(defn- remove-webshell-caddy-rule! [ws]
+  (when-let [rule-id (:caddyRuleId ws)]
     (try
-      (process/destroy! (:proc entry))
-      (println (format "[log-ttyd] 已停止 container-id=%s pid=%d" container-id (:pid entry)))
-      (catch Exception _))
-    (release-port (:port entry))
-    (swap! state update :log-ttyd-procs dissoc container-id)))
+      (let [parsed (caddy/parse-key rule-id)]
+        (when parsed (caddy/remove-rule! (:domain parsed) (:worker parsed) nil true)))
+      (catch Exception e
+        (println (format "[webshell] ⚠️ 移除终端 Caddy 规则失败: %s" (.getMessage e)))))))
 
-(defn stop-log-ttyd!
-  "停止已授权容器的日志 ttyd 进程并释放端口。"
-  ([container-id]
-   (stop-log-ttyd! container-id nil))
-  ([container-id actor]
-   (require-mutations-enabled!)
-   (require-container-access! container-id actor)
-   (stop-log-ttyd-process! container-id)))
+(defn- watch-webshell! [name pid proc]
+  ;; 守护线程：ttyd 退出说明容器已停止或被删除，回收端口与代理规则。
+  (let [watcher (Thread. (fn []
+                           (try
+                             (let [exit-code (process/wait proc)
+                                   ws (get-in @state [:webshells name])]
+                               (println (format "[webshell:%s] 已退出，退出码 %s" name exit-code))
+                               (when (and ws (= (get-in @state [:webshell-procs name :pid]) pid))
+                                 (release-port (:port ws))
+                                 (remove-webshell-caddy-rule! ws)
+                                 (swap! state update :webshell-procs dissoc name)
+                                 (swap! state assoc-in [:webshells name :ttydPid] nil)
+                                 (swap! state assoc-in [:webshells name :status] "stopped")))
+                             (catch InterruptedException _)
+                             (catch Exception e
+                               (println (format "[webshell:%s] 监听退出失败: %s" name (.getMessage e)))))))]
+    (.setDaemon watcher true)
+    (.start watcher)))
 
-(defn- do-start-log-ttyd!
-  "为容器启动新的日志 ttyd 进程。"
-  [container-id c]
-  (let [running? (= (:status c) "running")
-        port (allocate-port)
-        log-args (concat [(:container-cli-path config) "logs" "--tail" "200"]
-                         (when running? ["-f"])
-                         [(:name c)])
-        args ["-i" "127.0.0.1"
-              "-p" (str port)
-              "--max-clients" "5"
-              "--client-option" "fontSize=13"
-              "--client-option" "theme=monokai"]
-        proc (process/spawn (into [(:ttyd-path config)] (concat args log-args))
-                            {:out :inherit :err :inherit})
-        pid (process/pid proc)]
-    (swap! state assoc-in [:log-ttyd-procs container-id] {:pid pid :proc proc :port port})
-    (println (format "[log-ttyd] 已启动 container=%s pid=%d port=%d" (:name c) pid port))
-    ;; Watcher: auto-cleanup on process exit
-    (let [watcher (Thread. (fn []
-                             (try
-                               (let [exit-code (process/wait proc)]
-                                 (println (format "[log-ttyd:%d] 已退出，退出码 %s" pid exit-code))
-                                 (when (= (get-in @state [:log-ttyd-procs container-id :pid]) pid)
-                                   (swap! state update :log-ttyd-procs dissoc container-id)
-                                   (release-port port)))
-                               (catch InterruptedException _))))]
-      (.setDaemon watcher true)
-      (.start watcher))
-    {:port port
-     :url (str "http://" (:public-ip config) ":" port)}))
+(defn- start-webshell-process!
+  "启动（或重启）某个已登记容器的 ttyd 进程，复用已存在的 Caddy 规则。"
+  [name]
+  (let [ws (get-in @state [:webshells name])
+        args (vec (concat [(:ttyd-path config)
+                           "-i" (webshell-bind-address)
+                           "-p" (str (:port ws))
+                           "-c" (str (:user ws) ":" (:pass ws))
+                           "-W"
+                           "--client-option" "fontSize=14"
+                           "--client-option" "theme=monokai"]
+                          [(:container-cli-path config) "exec" "-it" name (:shell ws)]))
+        proc (process/spawn args {:out :inherit :err :inherit})
+        pid (process/pid proc)
+        existing-rule (:caddyRuleId ws)
+        rule-live? (and existing-rule
+                        (get-in @caddy/state [:entries (keyword existing-rule)]))]
+    (swap! state assoc-in [:webshell-procs name] {:pid pid :proc proc})
+    (swap! state assoc-in [:webshells name :ttydPid] pid)
+    (when-not rule-live?
+      (let [rule-id (add-webshell-caddy-rule (get-in @state [:webshells name]))]
+        (swap! state assoc-in [:webshells name :caddyRuleId] rule-id)))
+    (swap! state assoc-in [:webshells name :status] "running")
+    (println (format "[webshell] 已启动 container=%s pid=%d port=%d" name pid (:port ws)))
+    (watch-webshell! name pid proc)))
 
-(defn start-log-ttyd!
-  "启动已授权容器的日志 ttyd；存活实例会被复用。"
-  ([container-id actor]
-   (require-mutations-enabled!)
-   (require-ttyd-enabled!)
-   (let [c (require-container-access! container-id actor)]
-     (if-let [existing (get-in @state [:log-ttyd-procs container-id])]
-       (if (process/alive? (:proc existing))
-         {:port (:port existing)
-          :url (str "http://" (:public-ip config) ":" (:port existing))}
-         (do (stop-log-ttyd-process! container-id)
-             (do-start-log-ttyd! container-id c)))
-       (do-start-log-ttyd! container-id c))))
-  ([container-id user-id is-admin]
-   (start-log-ttyd! container-id (authorization/actor user-id is-admin))))
+(defn- stop-webshell-process! [name]
+  (when-let [ws (get-in @state [:webshells name])]
+    (when-let [entry (get-in @state [:webshell-procs name])]
+      (try
+        (when (process/alive? (:proc entry)) (process/destroy! (:proc entry)))
+        (catch Exception e
+          (println (format "[webshell:%s] 停止 ttyd 失败: %s" name (.getMessage e))))))
+    (release-port (:port ws))
+    (remove-webshell-caddy-rule! ws)
+    (swap! state update :webshell-procs dissoc name)
+    (swap! state update :webshells dissoc name)))
+
+(defn open-webshell!
+  "为运行中的容器开启（或复用）管理员终端。
+   返回公开终端信息；容器未运行、曝光未开启、shell 不可用时抛异常且不产生副作用。"
+  [target actor]
+  (require-mutations-enabled!)
+  (require-webshell-exposure!)
+  (let [{:keys [name containerId image] :as target-info} (resolve-shell-target target actor)]
+    (when-not (= (:state target-info) "running")
+      (throw (ex-info (:terminal-not-running (:validation i18n/strings))
+                      {:type ::terminal-not-running :containerName name})))
+    (let [existing (get-in @state [:webshells name])]
+      (if (and existing
+               (= (:containerId existing) containerId)
+               (webshell-alive? existing))
+        (to-public-webshell existing)
+        (do
+          ;; 同名旧容器已被删除、进程已退出、或首次开启：记录重建。
+          (when existing (stop-webshell-process! name))
+          (let [shell-path (resolve-webshell-shell name image)
+                creds (generate-credentials)
+                port (allocate-port)
+                ws {:name name
+                    :containerId containerId
+                    :image image
+                    :shell shell-path
+                    :user (:shellUser creds)
+                    :pass (:shellPass creds)
+                    :port port
+                    :ttydPid nil
+                    :caddyRuleId nil
+                    :status "stopped"
+                    :createdBy (:username actor)
+                    :createdAt (.toString (java.time.Instant/now))}]
+            (swap! state assoc-in [:webshells name] ws)
+            (try
+              (start-webshell-process! name)
+              (save-entries!)
+              (to-public-webshell (get-in @state [:webshells name]))
+              (catch Exception e
+                ;; 启动失败不留下半开状态：回收端口、规则与记录后原样抛出。
+                (stop-webshell-process! name)
+                (throw e)))))))))
+
+(defn close-webshell!
+  "管理员显式关闭终端：停止进程、移除规则并丢弃记录。"
+  [target actor]
+  (require-mutations-enabled!)
+  (authorization/require-actor! actor)
+  (authorization/require-admin! actor (:no-permission-container (:validation i18n/strings)))
+  (let [t (str target)
+        managed (find-managed-container t)
+        name (if managed (:name managed) t)]
+    (when (get-in @state [:webshells name])
+      (stop-webshell-process! name)
+      (save-entries!))
+    {:status "ok"}))
+
+(defn reveal-webshell-credentials
+  "按需返回终端明文凭据（仅管理员），不进入状态 GET、URL 或普通 DTO。"
+  [target actor]
+  (authorization/require-actor! actor)
+  (authorization/require-admin! actor (:no-permission-container (:validation i18n/strings)))
+  (let [ws (webshell-for target)]
+    (when-not ws
+      (throw (ex-info (:terminal-session-not-found (:validation i18n/strings))
+                      {:type ::terminal-session-not-found :target (str target)})))
+    {:user (:user ws) :pass (:pass (get-in @state [:webshells (:name ws)]))}))
+
+(defn restore-webshells!
+  "启动恢复：运行中的容器重建 ttyd，已停止的标为 stopped，已被删除的丢弃记录。
+
+   与受管容器不同，终端会话恢复失败不阻塞启动：它不拥有容器或数据，
+   丢掉只损失一个调试入口，而被删除的容器只能靠命令行判断。
+   调用方负责持久化（`sync-containers!` 在容器恢复后统一保存）。"
+  []
+  (when (and (:docker-mutations-enabled config false) (cli/available?))
+    (doseq [[name ws] (:webshells @state)]
+      (try
+        (if-not (cli/container-exists? name)
+          (do
+            (println (format "[webshell] 容器已不存在，丢弃终端记录: %s" name))
+            (stop-webshell-process! name))
+          (let [info (cli/inspect-container-details name)]
+            (swap! state assoc-in [:webshells name :containerId] (:id info))
+            (if (= (:state info) "running")
+              (if (webshell-alive? ws)
+                (swap! state assoc-in [:webshells name :status] "running")
+                (try
+                  (require-webshell-exposure!)
+                  (start-webshell-process! name)
+                  (catch Exception e
+                    (println (format "[webshell] 恢复终端失败，保持 stopped: %s — %s"
+                                     name (.getMessage e)))
+                    (release-port (:port ws))
+                    (remove-webshell-caddy-rule! ws)
+                    (swap! state assoc-in [:webshells name :caddyRuleId] nil)
+                    (swap! state assoc-in [:webshells name :ttydPid] nil)
+                    (swap! state assoc-in [:webshells name :status] "stopped"))))
+              (do
+                ;; 容器存在但未运行：ttyd 已不可能存活，保留记录供容器重新运行后再开启。
+                (release-port (:port ws))
+                (remove-webshell-caddy-rule! ws)
+                (swap! state assoc-in [:webshells name :caddyRuleId] nil)
+                (swap! state assoc-in [:webshells name :ttydPid] nil)
+                (swap! state assoc-in [:webshells name :status] "stopped")))))
+        (catch Exception e
+          (println (format "[webshell] 恢复终端会话失败 %s: %s" name (.getMessage e)))
+          (swap! state assoc-in [:webshells name :status] "stopped"))))))
+
+(defn stop-webshells!
+  "停机：停止所有终端 ttyd 进程（保留记录与 Caddy 规则，下次启动按同一规则恢复）。"
+  []
+  (doseq [name (keys (:webshells @state))]
+    (let [ws (get-in @state [:webshells name])
+          entry (get-in @state [:webshell-procs name])]
+      (when entry
+        (try
+          (when (process/alive? (:proc entry)) (process/destroy! (:proc entry)))
+          (catch Exception e
+            (println (format "[webshell:%s] 停机停止 ttyd 失败: %s" name (.getMessage e))))))
+      (release-port (:port ws))
+      (swap! state update :webshell-procs dissoc name)
+      (swap! state assoc-in [:webshells name :ttydPid] nil)
+      (swap! state assoc-in [:webshells name :status] "stopped"))))
 
 ;; --- Container Lifecycle Management ---
 
@@ -531,8 +797,8 @@
     ;; 1. Stop ttyd
      (stop-ttyd! c)
 
-    ;; 1.5 Stop log ttyd
-     (stop-log-ttyd-process! id)
+    ;; 1.5 容器即将消失，管理员终端记录同步清理
+     (stop-webshell-process! (:name c))
 
     ;; 2. Remove Caddy shell rule
      (when (:caddyRuleId c)
@@ -578,7 +844,7 @@
 
 (defn get-all-host-containers
   "Returns all containers visible via docker ps -a, enriched with app assignment state.
-   Each entry: {:name :image :state :status :assignedUser :appManaged :appContainerId}"
+   Each entry: {:name :image :state :status :assignedUser :appManaged :appContainerId :webshell}"
   []
   (try
     (let [host-containers (cli/list-containers)
@@ -592,7 +858,8 @@
                 (merge hc
                        {:assignedUser (:userId app-c)
                         :appManaged (some? app-c)
-                        :appContainerId (:id app-c)})))
+                        :appContainerId (:id app-c)
+                        :webshell (to-public-webshell (get-in @state [:webshells (:name hc)]))})))
             host-containers))
     (catch Exception _
       [])))
@@ -929,11 +1196,14 @@
                   all-failures (into @failures rollback-failures)]
               (reset! state snapshot)
               (throw-startup-recovery-failed! all-failures nil))
-            (save-entries!)))))))
+            (do
+              ;; 终端会话恢复是尽力而为：失败不阻止启动（见 restore-webshells!），
+              ;; 两者都在本次统一持久化。
+              (restore-webshells!)
+              (save-entries!))))))))
 
 (defn shutdown! []
-  (println "[docker-shutdown] 停止所有容器 ttyd 进程...")
+  (println "[docker-shutdown] 停止所有容器 ttyd 与终端会话进程...")
   (doseq [c (vals (:containers @state))]
     (stop-ttyd! c))
-  (doseq [id (keys (:log-ttyd-procs @state))]
-    (stop-log-ttyd-process! id)))
+  (stop-webshells!))

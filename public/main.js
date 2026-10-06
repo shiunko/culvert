@@ -213,112 +213,79 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // ============================================================
-  // Log viewer: ttyd popup window
+  // 容器日志面板：关闭按钮
   // ============================================================
-  var activeLogContainerId = null;
-  var logPollTimer = null;
-
-  function stopLogPoll() {
-    if (logPollTimer) {
-      clearInterval(logPollTimer);
-      logPollTimer = null;
-    }
-  }
-
-  function stopLogTtyd() {
-    if (activeLogContainerId) {
-      var csrf = document.querySelector('meta[name="csrf-token"]').getAttribute("content");
-      fetch("/docker/logs/stop", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "X-CSRF-Token": csrf,
-        },
-        body: "id=" + encodeURIComponent(activeLogContainerId),
-      }).catch(function () {});
-      activeLogContainerId = null;
-    }
-    stopLogPoll();
-  }
-
-  function openLogViewer(containerId) {
-    var csrf = document.querySelector('meta[name="csrf-token"]').getAttribute("content");
-    fetch("/docker/logs/start", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-CSRF-Token": csrf,
-      },
-      body: "id=" + encodeURIComponent(containerId),
-    })
-      .then(function (res) { return res.json(); })
-      .then(function (data) {
-        if (data.error) {
-          showToast(data.error, "error");
-          return;
-        }
-        // Open ttyd in a new popup window (same pattern as shell access)
-        var logWindow = window.open(data.url, "_blank",
-          "width=900,height=600,menubar=no,toolbar=no,location=yes,status=no");
-
-        // 弹窗被拦截时 window.open 返回 null 或立即 closed
-        if (!logWindow || logWindow.closed) {
-          fetch("/docker/logs/stop", {
-            method: "POST",
-            headers: {"Content-Type": "application/x-www-form-urlencoded", "X-CSRF-Token": csrf},
-            body: "id=" + encodeURIComponent(containerId),
-          }).catch(function () {});
-          showToast("弹窗被浏览器拦截，请在地址栏允许弹出窗口后重试", "warning");
-          return;
-        }
-
-        // 确认弹窗已打开，再登记 active 状态和轮询
-        activeLogContainerId = containerId;
-        stopLogPoll();
-        logPollTimer = setInterval(function () {
-          if (logWindow.closed) {
-            stopLogTtyd();
-          }
-        }, 1000);
-      })
-      .catch(function (err) {
-        showToast("日志查看器启动失败: " + err.message, "error");
-      });
-  }
-
-  // Delegated click handler for log buttons
   document.body.addEventListener("click", function (e) {
-    var logBtn = e.target.closest("[data-log-container]");
-    if (logBtn) {
+    if (e.target.closest('[data-action="logs.close"]')) {
       e.preventDefault();
-      e.stopPropagation();
-      openLogViewer(logBtn.getAttribute("data-log-container"));
+      closeLogPanel();
     }
-  });
-
-  // Cleanup on page unload
-  window.addEventListener("beforeunload", function () {
-    if (activeLogContainerId) {
-      var csrf = document.querySelector('meta[name="csrf-token"]').getAttribute("content");
-      navigator.sendBeacon(
-        "/docker/logs/stop",
-        new URLSearchParams({ id: activeLogContainerId, _csrf: csrf }).toString()
-      );
+    if (e.target.closest('[data-action="terminal.close"]')) {
+      e.preventDefault();
+      var terminalModal = document.getElementById("terminalModal");
+      if (terminalModal) {
+        terminalModal.close();
+      }
     }
-    stopLogPoll();
   });
 
   // ============================================================
-  // Log viewer: show wrapper when content loads
+  // 容器日志面板：htmx 换入 <dialog> 后打开，轮询换入正文后按需滚到底部
   // ============================================================
   document.body.addEventListener("htmx:afterSwap", function (evt) {
-    if (evt.detail.target.id === "password-modal-container") {
+    var target = evt.detail.target;
+    if (target.id === "password-modal-container") {
       var modal = document.getElementById("passwordModal");
       if (modal) {
         modal.showModal();
       }
     }
+    if (target.id === "log-panel-container") {
+      var logModal = document.getElementById("logModal");
+      if (logModal) {
+        logModal.showModal();
+        scrollLogToEnd();
+      }
+    }
+    if (target.id === "terminal-modal-container") {
+      var terminalModal = document.getElementById("terminalModal");
+      if (terminalModal) {
+        terminalModal.showModal();
+      }
+    }
+    if (target.id === "log-stream") {
+      scrollLogToEnd();
+    }
   });
+
+  function logFollowEnabled() {
+    var follow = document.getElementById("log-follow");
+    return !follow || follow.checked;
+  }
+
+  function scrollLogToEnd() {
+    var box = document.getElementById("log-stream");
+    if (box && logFollowEnabled()) {
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  function closeLogPanel() {
+    var logModal = document.getElementById("logModal");
+    if (logModal) {
+      logModal.close();
+    }
+  }
+
+  // 面板关闭（按钮/背景/Esc）后清空容器，停掉内部的轮询元素，避免隐藏面板继续请求。
+  document.body.addEventListener("close", function (e) {
+    if (e.target && e.target.id === "logModal") {
+      var container = document.getElementById("log-panel-container");
+      if (container) {
+        container.innerHTML = "";
+      }
+    }
+  }, true);
 
   // ============================================================
   // Password modal: close and refresh after password change

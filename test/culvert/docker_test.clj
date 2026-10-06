@@ -1,6 +1,8 @@
 (ns culvert.docker-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [cheshire.core :as json]
+            [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [culvert.authorization :as authorization]
             [culvert.caddy :as caddy]
             [culvert.cli :as cli]
             [culvert.config :as config]
@@ -61,6 +63,250 @@
     (is (set? (:used-ports @docker/state)))))
 
 ;; ============================================================
+;; 日志目标解析与读取
+;; ============================================================
+
+(deftest log-target-resolution-and-authorization
+  (let [original @docker/state
+        alice {:username "alice" :admin? false}
+        admin {:username "root" :admin? true}
+        container {:id "a" :name "alice-box" :userId "alice" :ports {}
+                   :status "running"}]
+    (try
+      (reset! docker/state {:containers {"a" container}
+                            :used-ports #{} :ttyd-procs {}})
+      (testing "受管容器：所有者与管理员可读，其他用户被拒"
+        (is (= :managed (:source (docker/resolve-log-target "a" alice))))
+        (is (= :managed (:source (docker/resolve-log-target "alice-box" alice))))
+        (is (= :managed (:source (docker/resolve-log-target "a" admin))))
+        (is (= ::authorization/forbidden
+               (:type (ex-data (try (docker/resolve-log-target "a" {:username "bob" :admin? false})
+                                    nil
+                                    (catch Exception e e)))))))
+      (testing "未受管宿主机容器：只有管理员可读，普通用户被拒且不触发 CLI 查询"
+        (let [inspected (atom 0)]
+          (with-redefs [cli/inspect-container-details (fn [_]
+                                                        (swap! inspected inc)
+                                                        {:id "host-id" :name "host-box"
+                                                         :image "nginx" :state "exited"})]
+            (is (thrown? Exception (docker/resolve-log-target "host-box" alice)))
+            (is (zero? @inspected))
+            (is (= {:source :host :id "host-id" :name "host-box" :state "exited"}
+                   (docker/resolve-log-target "host-box" admin)))
+            (is (= 1 @inspected)))))
+      (testing "宿主容器不存在时转为稳定的容器不存在错误"
+        (with-redefs [cli/inspect-container-details (fn [_] (throw (Exception. "No such object")))]
+          (let [error (try (docker/resolve-log-target "ghost" admin) nil (catch Exception e e))]
+            (is (= ::docker/container-not-found (:type (ex-data error)))))))
+      (finally
+        (reset! docker/state original)))))
+
+(deftest read-logs-uses-merged-cli-output
+  (let [original @docker/state
+        admin {:username "root" :admin? true}
+        argv (atom nil)]
+    (try
+      (reset! docker/state {:containers {} :used-ports #{} :ttyd-procs {}})
+      (with-redefs [cli/inspect-container-details
+                    (fn [_] {:id "host-id" :name "host-box" :image "nginx" :state "running"})
+                    process/run
+                    (fn [a] (reset! argv a)
+                      {:exit 0 :out "stdout-line\n" :err "stderr-line\n"})]
+        (let [result (docker/read-logs "host-id" admin {:tail 300})]
+          (is (= "host-box" (:name result)))
+          (is (str/includes? (:text result) "stdout-line"))
+          (is (str/includes? (:text result) "stderr-line"))
+          (is (= "300" (second (drop-while #(not= "--tail" %) @argv))))))
+      (finally
+        (reset! docker/state original)))))
+
+;; ============================================================
+;; 管理员容器终端（持久 webshell）
+;; ============================================================
+
+(def ^:private webshell-config
+  {:docker-mutations-enabled true
+   :ttyd-enabled true
+   :ip-mode true
+   :ttyd-session-public true
+   :listen-address "0.0.0.0"
+   :public-ip "10.0.0.9"
+   :container-cli-path "docker"
+   :ttyd-path "ttyd"})
+
+(defn- with-webshell-env
+  "重置 docker state 并绑定测试用配置与容器环境。
+   opts 可覆盖 :spawn 与 :shell-available?。"
+  [opts f]
+  (let [original @docker/state
+        spawn (or (:spawn opts) (fn [_ _] (atom {:pid 4242 :proc :fake-proc})))]
+    (try
+      (reset! docker/state {:containers {} :webshells {} :webshell-procs {}
+                            :used-ports #{} :ttyd-procs {}})
+      (with-redefs [config/config (merge config/config webshell-config)
+                    cli/inspect-container-details
+                    (fn [_] {:id "host-id-1" :name "host-box" :image "nginx" :state "running"})
+                    cli/shell-available-in-container? (fn [_ _] ((or (:shell-available? opts)
+                                                                     (constantly true))))
+                    process/spawn spawn
+                    process/pid (fn [_] 4242)
+                    process/alive? (fn [_] true)
+                    ;; 守护线程会等 ttyd 退出；测试里用永不归零的闩锁保持会话存活。
+                    process/wait (fn [_] (.await (java.util.concurrent.CountDownLatch. 1)))
+                    docker/save-entries! (fn [] nil)]
+        (f))
+      (finally
+        (reset! docker/state original)))))
+
+(deftest webshell-open-requires-admin
+  (testing "非管理员与未认证 actor 在 spawn 之前被拒绝"
+    (let [spawned (atom 0)]
+      (with-webshell-env
+        {:spawn (fn [_ _] (swap! spawned inc) (atom {:pid 1 :proc :p}))}
+        (fn []
+          (let [error (try (docker/open-webshell! "host-box" {:username "alice" :admin? false})
+                           nil (catch Exception e e))]
+            (is (= ::authorization/admin-required (:type (ex-data error)))))
+          (is (thrown? Exception (docker/open-webshell! "host-box" nil)))
+          (is (zero? @spawned))
+          (is (empty? (:webshells @docker/state))))))))
+
+(deftest webshell-open-requires-running-container
+  (testing "容器未运行时拒绝开启，且不分配端口、不落库"
+    (let [spawned (atom 0)]
+      (with-webshell-env
+        {:spawn (fn [_ _] (swap! spawned inc) (atom {:pid 1 :proc :p}))}
+        (fn []
+          (with-redefs [cli/inspect-container-details
+                        (fn [_] {:id "host-id-1" :name "host-box" :image "nginx" :state "exited"})]
+            (let [error (try (docker/open-webshell! "host-box" {:username "root" :admin? true})
+                             nil (catch Exception e e))]
+              (is (= ::docker/terminal-not-running (:type (ex-data error))))
+              (is (zero? @spawned))
+              (is (empty? (:webshells @docker/state)))
+              (is (empty? (:used-ports @docker/state))))))))))
+
+(deftest webshell-open-requires-shell
+  (testing "容器内没有可用 shell 时给出稳定错误，并回收已分配端口"
+    (with-webshell-env
+      {:shell-available? (constantly false)}
+      (fn []
+        (let [error (try (docker/open-webshell! "host-box" {:username "root" :admin? true})
+                         nil (catch Exception e e))]
+          (is (= ::docker/terminal-shell-unavailable (:type (ex-data error))))
+          (is (empty? (:webshells @docker/state)))
+          (is (empty? (:used-ports @docker/state))))))))
+
+(deftest webshell-open-spawns-ttyd-and-keeps-records-json-safe
+  (testing "开启终端：ttyd 以 argv 向量执行 docker exec，记录不携带进程句柄"
+    (let [argv (atom nil)
+          saved (atom 0)]
+      (with-webshell-env
+        {:spawn (fn [a _] (reset! argv a) (atom {:pid 4242 :proc :fake-proc}))}
+        (fn []
+          (with-redefs [docker/save-entries! (fn [] (swap! saved inc))]
+            (let [result (docker/open-webshell! "host-box" {:username "root" :admin? true})]
+              (is (= "host-box" (:name result)))
+              (is (= "running" (:status result)))
+              (is (= "http://10.0.0.9:17680" (:url result)))
+              (is (= 1 @saved))
+              (is (vector? @argv))
+              (is (= ["exec" "-it" "host-box" "/bin/bash"]
+                     (subvec @argv (- (count @argv) 4))))
+              (is (some #{"-W"} @argv))
+              (is (= "0.0.0.0" (second (drop-while #(not= "-i" %) @argv))))
+              (let [record (get-in @docker/state [:webshells "host-box"])]
+                (is (= "running" (:status record)))
+                (is (= "root" (:createdBy record)))
+                (is (nil? (:proc record)))
+               ;; 记录会写入 JSON，必须只包含数据
+                (is (string? (json/generate-string (:webshells @docker/state))))))))))))
+
+(deftest webshell-open-reuses-live-session
+  (testing "同一容器已有存活会话时幂等返回，不重复 spawn"
+    (let [spawned (atom 0)]
+      (with-webshell-env
+        {:spawn (fn [_ _] (swap! spawned inc) (atom {:pid 700 :proc :live}))}
+        (fn []
+          (let [admin {:username "root" :admin? true}
+                _ (docker/open-webshell! "host-box" admin)
+                again (docker/open-webshell! "host-box" admin)]
+            (is (= 1 @spawned))
+            (is (= "running" (:status again)))))))))
+
+(deftest webshell-open-disabled-without-exposure-flag
+  (testing "IP 模式未开 ttydSessionPublic 时拒绝开启，不产生副作用"
+    (let [spawned (atom 0)]
+      (with-webshell-env
+        {:spawn (fn [_ _] (swap! spawned inc) (atom {:pid 1 :proc :p}))}
+        (fn []
+          (with-redefs [config/config (assoc config/config :ttyd-session-public false)]
+            (let [error (try (docker/open-webshell! "host-box" {:username "root" :admin? true})
+                             nil (catch Exception e e))]
+              (is (= ::docker/terminal-exposure-disabled (:type (ex-data error))))
+              (is (zero? @spawned))
+              (is (empty? (:used-ports @docker/state))))))))))
+
+(deftest webshell-close-stops-process-and-drops-record
+  (testing "显式关闭：销毁进程、释放端口并丢弃记录"
+    (let [destroyed (atom [])]
+      (with-webshell-env
+        nil
+        (fn []
+          (docker/open-webshell! "host-box" {:username "root" :admin? true})
+          (with-redefs [process/destroy! (fn [proc] (swap! destroyed conj proc))]
+            (is (= {:status "ok"} (docker/close-webshell! "host-box" {:username "root" :admin? true})))
+            (is (= 1 (count @destroyed)))
+            (is (empty? (:webshells @docker/state)))
+            (is (empty? (:used-ports @docker/state)))))))))
+
+(deftest webshell-credentials-require-admin-and-existing-session
+  (testing "凭据按需读取，未开启或非管理员均被拒绝"
+    (with-webshell-env
+      nil
+      (fn []
+        (let [admin {:username "root" :admin? true}]
+          (is (thrown? Exception (docker/reveal-webshell-credentials "host-box" admin)))
+          (docker/open-webshell! "host-box" admin)
+          (let [creds (docker/reveal-webshell-credentials "host-box" admin)]
+            (is (string? (:user creds)))
+            (is (string? (:pass creds))))
+          (let [error (try (docker/reveal-webshell-credentials "host-box" {:username "alice" :admin? false})
+                           nil (catch Exception e e))]
+            (is (= ::authorization/admin-required (:type (ex-data error))))))))))
+
+(deftest webshell-restore-follows-container-existence
+  (testing "启动恢复：容器已删除则丢记录，未运行则标 stopped，运行中则重建 ttyd"
+    (let [spawned (atom 0)
+          record {:name "gone-box" :containerId "id-1" :image "nginx" :shell "/bin/sh"
+                  :user "dev_a" :pass "p" :port 17690 :ttydPid nil :caddyRuleId nil
+                  :status "stopped" :createdBy "root" :createdAt "2026-01-01T00:00:00Z"}]
+      (with-webshell-env
+        {:spawn (fn [_ _] (swap! spawned inc) (atom {:pid 9 :proc :p9}))}
+        (fn []
+          (swap! docker/state assoc :webshells {"gone-box" record
+                                                "stopped-box" (assoc record :name "stopped-box"
+                                                                     :port 17691)
+                                                "live-box" (assoc record :name "live-box"
+                                                                  :port 17692)})
+          (swap! docker/state update :used-ports into [17690 17691 17692])
+          (with-redefs [cli/available? (constantly true)
+                        cli/container-exists? (fn [name] (not= name "gone-box"))
+                        cli/inspect-container-details
+                        (fn [name] {:id (str "id-" name)
+                                    :name name
+                                    :image "nginx"
+                                    :state (if (= name "live-box") "running" "exited")})]
+            (docker/restore-webshells!)
+            (is (= 1 @spawned))
+            (is (not (contains? (:webshells @docker/state) "gone-box")))
+            (is (= "stopped" (get-in @docker/state [:webshells "stopped-box" :status])))
+            (is (= "running" (get-in @docker/state [:webshells "live-box" :status])))
+           ;; 已删除与已停止的记录都不再占用端口，只有重建的会话占一个
+            (is (= #{(get-in @docker/state [:webshells "live-box" :port])}
+                   (:used-ports @docker/state)))))))))
+
+;; ============================================================
 ;; 容器状态结构测试
 ;; ============================================================
 
@@ -99,9 +345,7 @@
     (try
       (reset! docker/state {:containers {"a" container}
                             :used-ports #{}
-                            :ttyd-procs {}
-                            :log-ttyd-procs
-                            {"a" {:pid 1 :port 17777 :proc :fake}}})
+                            :ttyd-procs {}})
       (with-redefs [config/config (assoc config/config :docker-mutations-enabled true)
                     caddy/add-rule! (fn [& _] (swap! effects conj :caddy))
                     docker/save-entries! (fn [] (swap! effects conj :save))]
@@ -111,12 +355,9 @@
         (is (thrown? Exception (docker/expose-port! "a" "8080" "")))
         (is (thrown? Exception (docker/unexpose-port! "a" "8080")))
         (is (thrown? Exception (docker/toggle-port! "a" "8080")))
-        (is (thrown? Exception (docker/start-log-ttyd! "a" bob)))
-        (is (thrown? Exception (docker/start-log-ttyd! "a" nil)))
-        (is (thrown? Exception (docker/stop-log-ttyd! "a" bob)))
-        (is (thrown? Exception (docker/stop-log-ttyd! "a"))))
+        (is (thrown? Exception (docker/read-logs "a" bob)))
+        (is (thrown? Exception (docker/read-logs "a" nil))))
       (is (empty? @effects))
-      (is (= #{17777} (set (keep :port (vals (:log-ttyd-procs @docker/state))))))
       (is (= container (get-in @docker/state [:containers "a"])))
       (finally
         (reset! docker/state original)))))
@@ -134,8 +375,7 @@
       (try
         (reset! docker/state {:containers {"a" container}
                               :used-ports #{}
-                              :ttyd-procs {}
-                              :log-ttyd-procs {}})
+                              :ttyd-procs {}})
         (with-redefs [config/config (dissoc config/config :docker-mutations-enabled)
                       cli/pull-image (fn [& _] (swap! effects conj :pull))
                       cli/run-container (fn [& _] (swap! effects conj :run))
@@ -151,15 +391,12 @@
                             (fn [] (docker/start-container! "a" actor))
                             (fn [] (docker/expose-port! "a" "8080" "" actor))
                             (fn [] (docker/unexpose-port! "a" "8080" actor))
-                            (fn [] (docker/toggle-port! "a" "8080" actor))
-                            (fn [] (docker/start-log-ttyd! "a" actor))
-                            (fn [] (docker/stop-log-ttyd! "a" actor))]]
+                            (fn [] (docker/toggle-port! "a" "8080" actor))]]
             (invoke! mutation)))
         (is (empty? @effects))
         (is (= {:containers {"a" container}
                 :used-ports #{}
-                :ttyd-procs {}
-                :log-ttyd-procs {}}
+                :ttyd-procs {}}
                @docker/state))
         (finally
           (reset! docker/state original))))))
@@ -313,9 +550,10 @@
                     [:destroy :ttyd-proc]]
                    @effects))
             (is (= {:containers {"c1" container}
+                    :webshells {}
+                    :webshell-procs {}
                     :used-ports (:used-ports original)
-                    :ttyd-procs (:ttyd-procs original)
-                    :log-ttyd-procs (:log-ttyd-procs original)}
+                    :ttyd-procs (:ttyd-procs original)}
                    @docker/state))))
         (finally
           (reset! docker/state original))))))

@@ -15,7 +15,7 @@
 ## 路由与授权
 
 - `handlers/route-dispatcher` 以 cond 逐条匹配 request-method + URI；业务路由一律包 `core/wrap-auth`，`/admin/*`、`/panel/users` 与 `/panel/host` 再包 `admin-only`（role=admin）；`/login`、`/logout`、`/health*` 免认证。只读大屏 `GET /wall` 与 `GET /` 同边界（`wrap-auth`），无任何 mutation 入口，且不加载 `tabs.js`。
-- mutation 统一节奏：`parse-form-body` → `csrf-validate`（`_csrf` 字段或 `X-CSRF-Token` 头）→ 调领域入口（端口暴露与 ttyd 日志经 `request-actor` 构造 `authorization/actor`）→ `sse/broadcast!` → `views/build-oob-response`。
+- mutation 统一节奏：`parse-form-body` → `csrf-validate`（`_csrf` 字段或 `X-CSRF-Token` 头）→ 调领域入口（端口暴露与管理员终端经 `request-actor` 构造 `authorization/actor`）→ `sse/broadcast!` → `views/build-oob-response`。
 - Handler 不是唯一授权边界，领域授权（`authorization.clj` 及各 manager）是最终校验点。
 - 视图当前直接读领域 atom 与只读计数函数（如 `compute-usage`），这是存量交织而非完成态；方向是视图接收数据、只做渲染，不得在视图执行命令或发起 mutation。
 
@@ -79,7 +79,8 @@ Kiosk 大屏的三个面板（`wall-kpis`/`wall-topology`/`wall-alerts`）**只�
 - admin 改密是一次性 CSRF：表单按 `:action :admin/change-password` 生成，校验时 consume，成功后经 `HX-Trigger closePasswordModal` 关闭弹窗并整页 reload。
 - 密码弹窗：`hx-get /admin/password-form` 目标 `#password-modal-container`，`htmx:afterSwap` 后对 `#passwordModal` 调 `showModal()`。
 - 凭据显隐与复制依赖卡片上的 `data-resource-kind`、`data-resource-id`、`data-credential-endpoint`，以及 `data-copy`、`data-copy-pass`、`.cred-pass-input`；明文只通过带 CSRF 的 POST `/docker/credentials` 或 `/smolvm/credentials` 按需返回，不进入状态 GET、URL 或普通 DTO。
-- 日志弹窗：`data-log-container` 触发 POST `/docker/logs/start` 返回 `{url}` 开 ttyd 弹窗；轮询窗口关闭后 POST `/docker/logs/stop`，页面卸载用 `sendBeacon` 兜底。
+- 容器日志面板（已取代 ttyd 日志弹窗）：docker 卡片与管理页主机容器行的日志按钮带 `hx-get /docker/logs?target=<id|name>`，换入 `#log-panel-container` 的 `#logModal`；`htmx:afterSwap` 后 `showModal()`，轮询换入 `#log-stream` 后按需滚到底部。正文轮询走 `GET /docker/logs/content`（只返回 `<pre>`，因此外层 `#log-stream` 的 `hx-get`/`hx-trigger` 不会被换掉），“跟随”勾选（`#log-follow`）既是 htmx 触发器过滤条件也是滚动条件；关闭走 `data-action="logs.close"`。日志读取不经过任何 ttyd/端口，已停止（exited）的容器同样可读。
+- 管理员容器终端（持久 webshell）：管理页主机容器行的终端按钮带 `hx-post /admin/containers/terminal/open`，换入 `#terminal-modal-container` 的 `#terminalModal`（展示打开链接与一次性明文凭据）；`data-action="terminal.close"` 关闭弹窗，`POST /admin/containers/terminal/credentials` 按需重看凭据，`POST /admin/containers/terminal/close` 关闭会话并换回 `#admin-containers-tbody`。三个路由都是 `admin-only` + CSRF，领域入口再校验一次管理员身份。
 - 行内备注编辑：GET `/forward/remark-form`、`/forward/remark-cancel`、`/caddy/remark-form`、`/caddy/remark-cancel`，目标 `closest .remark-cell`。
 - admin 容器过滤：`.filter-btn[data-filter]` 加行上 `data-state`，HTMX 重换 tbody 后由 main.js 重放当前过滤。
 

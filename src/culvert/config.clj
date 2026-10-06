@@ -172,6 +172,9 @@
       :smolvm-mutations-enabled (not= false (:smolvmMutationsEnabled raw))
       :ttyd-path (configured-command (:ttydPath raw) "ttyd")
       :ttyd-enabled (not= false (:ttydEnabled raw))
+      ;; 管理员容器终端在 IP 模式下默认只绑 loopback（远端浏览器不可达）；
+      ;; 只有显式开启本项时才绑定 :listen-address，把曝光决定留给运维。
+      :ttyd-session-public (true? (:ttydSessionPublic raw))
       :ttyd-port-start (or (get-in raw [:ttydPortRange :start]) 17680)
       :ttyd-port-end (or (get-in raw [:ttydPortRange :end]) 17999)
       :ttyd-max-clients (let [v (:ttydMaxClients raw)] (if (nil? v) 1 (int v)))

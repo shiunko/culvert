@@ -894,6 +894,55 @@
               (ui.icon/icon :alert-triangle {:size 12}) (:container-unassigned dash)])]
           [:td
            [:div {:style "display:flex;flex-direction:column;gap:0.25rem"}
+            [:div.pf-row-actions
+             [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+              {:title (:view-logs tip)
+               :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id hc)) "UTF-8"))
+               :hx-target "#log-panel-container"
+               :hx-swap "innerHTML"}
+              (ui.icon/icon :file-text {:size 14})]
+             (let [ws (:webshell hc)
+                   running? (= (:status ws) "running")
+                   terminal-vals (mutation-vals csrf-token {:target (:name hc)})]
+               (list
+                (cond
+                  ;; 终端已开启且存活：直接打开，不需要再起一次进程。
+                  running?
+                  [:a.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
+                   {:href (:url ws) :target "_blank" :rel "noopener noreferrer"
+                    :title (str (:open-terminal-window btn) "（" (:createdBy ws) "）")}
+                   (ui.icon/icon :terminal {:size 14})]
+
+                  ;; 容器未运行：ttyd 无法连接，按钮置灰。
+                  (not= (:state hc) "running")
+                  [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                   {:type "button" :disabled true :title (:terminal-not-running (:validation i18n/strings))}
+                   (ui.icon/icon :terminal {:size 14})]
+
+                  :else
+                  [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                   {:type "button" :title (:open-terminal tip)
+                    :hx-post "/admin/containers/terminal/open"
+                    :hx-target "#terminal-modal-container"
+                    :hx-swap "innerHTML"
+                    :hx-vals terminal-vals}
+                   (ui.icon/icon :terminal {:size 14})])
+                (when (:status ws)
+                  (list
+                   [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+                    {:type "button" :title (:terminal-credentials tip)
+                     :hx-post "/admin/containers/terminal/credentials"
+                     :hx-target "#terminal-modal-container"
+                     :hx-swap "innerHTML"
+                     :hx-vals terminal-vals}
+                    (ui.icon/icon :key {:size 14})]
+                   [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-error
+                    {:type "button" :title (:stop-terminal tip)
+                     :hx-post "/admin/containers/terminal/close"
+                     :hx-target "#admin-containers-tbody"
+                     :hx-swap "innerHTML"
+                     :hx-vals terminal-vals}
+                    (ui.icon/icon :x {:size 14})]))))]
             (if (:assignedUser hc)
               (list
                [:select.pf-select
@@ -1057,6 +1106,113 @@
     (= status "stopped") [:span.pf-badge.pf-badge-error (:stopped sts)]
     :else [:span.pf-badge.pf-badge-error (:abnormal sts)]))
 
+;; ============================================================
+;; 容器日志面板（应用内同源，见 docs/10 ttyd 条目）
+;; ============================================================
+
+(def ^:private log-tail-options [200 1000 5000])
+
+(defn- log-stream
+  "日志正文的轮询容器：外层保留 hx-get/hx-trigger，内层 <pre> 随轮询被整体换掉，因此滚动状态由外层容器维持。"
+  [{:keys [target tail text]}]
+  (list
+   [:div.pf-row {:style "justify-content:space-between"}
+    [:div.pf-row
+     [:label.pf-row {:style "font-size:0.78rem"}
+      [:input.pf-checkbox {:type "checkbox" :id "log-follow" :checked true}]
+      (:log-follow (:modal i18n/strings))]
+     [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+      {:type "button"
+       :title (:log-refresh (:tooltip i18n/strings))
+       :hx-get (str "/docker/logs/content?target=" (java.net.URLEncoder/encode (str target) "UTF-8")
+                    "&tail=" tail)
+       :hx-target "#log-stream"
+       :hx-swap "innerHTML"}
+      (ui.icon/icon :refresh-cw {:size 13})]]
+    [:select.pf-select
+     {:style "width:auto" :name "tail"
+      :hx-get "/docker/logs"
+      :hx-target "#log-panel-container"
+      :hx-swap "innerHTML"
+      :hx-include "this"
+      :hx-vals (json/generate-string {:target (str target)})}
+     (for [n log-tail-options]
+       [:option {:value (str n) :selected (= n tail)} (str n " 行")])]]
+   [:div#log-stream.pf-log-view
+    {:hx-get (str "/docker/logs/content?target=" (java.net.URLEncoder/encode (str target) "UTF-8")
+                  "&tail=" tail)
+     :hx-trigger "every 3s [document.getElementById('log-follow').checked]"
+     :hx-target "this"
+     :hx-swap "innerHTML"}
+    [:pre {:style "margin:0"} (or text "")]]))
+
+(defn render-log-panel
+  "渲染容器日志面板片段（htmx 换入 #log-panel-container 的 <dialog>）。
+   参数 {:target :name :state :source :text :error :tail}；:error 存在时只展示安全提示。"
+  [{:keys [target name state error tail text]}]
+  (let [tail (if (some #{tail} log-tail-options) tail 200)
+        title (:log-title (:modal i18n/strings))]
+    (h/html
+     [:dialog.pf-modal {:id "logModal"}
+      [:div.pf-modal-box {:style "width:min(1100px,92vw)"}
+       [:div.pf-row {:style "justify-content:space-between;align-items:center"}
+        [:h3.pf-modal-title {:style "margin:0"}
+         title ": " [:code (or name target)]]
+        [:div.pf-row
+         (when state [:span.pf-badge.pf-badge-ghost state])
+         [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+          {:type "button" :data-action "logs.close" :title (:close (:button i18n/strings))}
+          (ui.icon/icon :x {:size 14})]]]
+       [:div.pf-modal-body
+        (if error
+          [:div.pf-text-error error]
+          (log-stream {:target target :tail tail :text text}))]]
+      [:form.pf-modal-backdrop-close {:method "dialog"}
+       [:button "close"]]])))
+
+(defn render-log-content
+  "仅渲染日志正文（轮询目标），外层 #log-stream 保留 hx-* 属性。"
+  [{:keys [text error]}]
+  (h/html [:pre {:style "margin:0"} (or error text "")]))
+
+;; ============================================================
+;; 管理员容器终端面板（凭据只在开启时按需展示）
+;; ============================================================
+
+(defn render-terminal-panel
+  "渲染管理员终端凭据面板片段（htmx 换入 #terminal-modal-container 的 <dialog>）。
+   参数 {:name :url :user :pass :error}；明文凭据只在此片段出现，不进状态 GET。"
+  [{:keys [name url user pass error]}]
+  (let [m (:modal i18n/strings)
+        btn (:button i18n/strings)
+        tip (:tooltip i18n/strings)]
+    (h/html
+     [:dialog.pf-modal {:id "terminalModal"}
+      [:div.pf-modal-box {:style "width:min(680px,92vw)"}
+       [:h3.pf-modal-title (str (:terminal-title m) ": " name)]
+       [:div.pf-modal-body
+        (if error
+          [:div.pf-text-error error]
+          (list
+           [:div.pf-row
+            [:span.pf-text-muted (str (:terminal-url m) ": ")]
+            [:a.pf-link {:href url :target "_blank" :rel "noopener noreferrer"}
+             (ui.icon/icon :external-link {:size 12}) " " [:code url]]]
+           [:div.pf-row
+            (ui.icon/icon :user {:size 14})
+            [:code.pf-mono {:style "font-size:0.78rem"} user]
+            [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+             {:type "button" :title (:copy-username tip) :data-copy user} (:copy btn)]]
+           [:div.pf-row
+            (ui.icon/icon :key {:size 14})
+            [:code.pf-mono {:style "font-size:0.78rem"} pass]
+            [:button.pf-btn.pf-btn-ghost.pf-btn-xs
+             {:type "button" :title (:copy-password tip) :data-copy pass} (:copy btn)]]
+           [:p.pf-text-muted {:style "font-size:0.75rem"} (:terminal-hint m)]))]
+       [:div.pf-modal-actions
+        [:button.pf-btn {:type "button" :data-action "terminal.close"} (:close btn)]]
+       [:form.pf-modal-backdrop-close {:method "dialog"} [:button "close"]]]])))
+
 (defn render-docker-tbody [username is-admin? csrf-token]
   (let [docker-entries (docker/get-containers username is-admin?)
         tip (:tooltip i18n/strings)
@@ -1084,7 +1240,9 @@
            [:div.pf-row
             [:button.pf-btn.pf-btn-ghost.pf-btn-xs
              {:title (:view-logs tip)
-              :data-log-container (:id c)}
+              :hx-get (str "/docker/logs?target=" (java.net.URLEncoder/encode (str (:id c)) "UTF-8"))
+              :hx-target "#log-panel-container"
+              :hx-swap "innerHTML"}
              (ui.icon/icon :file-text {:size 14})]
             (when (= (:status c) "stopped")
               [:button.pf-btn.pf-btn-ghost.pf-btn-xs.pf-text-success
@@ -2129,6 +2287,12 @@
 
         ;; Password Modal Container
         [:div {:id "password-modal-container"}]
+
+        ;; Container Log Modal Container（应用内同源日志面板）
+        [:div {:id "log-panel-container"}]
+
+        ;; Admin Terminal Modal Container（管理员容器终端凭据）
+        [:div {:id "terminal-modal-container"}]
 
         ;; 命令面板注册表与覆盖层（默认隐藏，纯增强）
         (render-command-registry is-admin?)

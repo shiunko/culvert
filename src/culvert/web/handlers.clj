@@ -175,8 +175,47 @@
   (views/render-wall req))
 
 ;; ============================================================
-;; Container Logs Handler
+;; Container Logs Handlers（应用内同源日志面板）
 ;; ============================================================
+
+(defn- html-fragment-response [hiccup]
+  {:status 200
+   :headers {"Content-Type" "text/html; charset=utf-8"}
+   :body (str hiccup)})
+
+(defn- parse-log-tail [raw]
+  (let [n (try (Long/parseLong (str raw)) (catch Exception _ nil))]
+    (if (and n (<= 1 n 5000)) n 200)))
+
+(defn- log-panel-error [target tail e]
+  (views/render-log-panel {:target target
+                           :tail tail
+                           :error (:message (core/error-info e))}))
+
+(defn- handle-docker-logs [req]
+  (let [params (core/parse-query-string (:query-string req))
+        target (:target params)
+        tail (parse-log-tail (:tail params))
+        actor (request-actor req)]
+    (try
+      (let [{:keys [source name state text]} (docker/read-logs target actor {:tail tail})]
+        (html-fragment-response
+         (views/render-log-panel {:target target :source source :name name
+                                  :state state :text text :tail tail})))
+      (catch Exception e
+        (html-fragment-response (log-panel-error target tail e))))))
+
+(defn- handle-docker-logs-content [req]
+  (let [params (core/parse-query-string (:query-string req))
+        target (:target params)
+        tail (parse-log-tail (:tail params))
+        actor (request-actor req)]
+    (try
+      (html-fragment-response
+       (views/render-log-content {:text (:text (docker/read-logs target actor {:tail tail}))}))
+      (catch Exception e
+        (html-fragment-response
+         (views/render-log-content {:error (:message (core/error-info e))}))))))
 
 (defn- handle-docker-stats [req]
   (let [user (:user req)
@@ -193,29 +232,6 @@
                           {:cpu-pct 0.0 :mem-pct 0.0 :mem-used "—" :mem-limit "—"})]))]
     (core/json-response result)))
 
-(defn- handle-docker-logs-start [req]
-  (let [params (core/parse-form-body req)
-        id (:id params)
-        actor (request-actor req)]
-    (if-not (core/csrf-validate (core/get-csrf-token req params))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (let [result (docker/start-log-ttyd! id actor)]
-          (core/json-response result))
-        (catch Exception e
-          (core/json-error-response e))))))
-
-(defn- handle-docker-logs-stop [req]
-  (let [params (core/parse-form-body req)
-        id (:id params)
-        actor (request-actor req)]
-    (if-not (core/csrf-validate (core/get-csrf-token req params))
-      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
-      (try
-        (docker/stop-log-ttyd! id actor)
-        (core/json-response {:status "ok"})
-        (catch Exception e
-          (core/json-error-response e))))))
 
 ;; ============================================================
 ;; Route Dispatcher Handlers
@@ -794,6 +810,78 @@
                    [:button "close"]]]))}))
 
 ;; ============================================================
+;; 管理员容器终端（持久 webshell）
+;; ============================================================
+
+(defn- terminal-activity [target action]
+  {:action action
+   :resource {:kind "container" :id target :key (str "docker-" target)}})
+
+(defn- handle-admin-terminal-open [req]
+  (let [params (core/parse-form-body req)
+        csrf-token (core/get-csrf-token req params)
+        target (:target params)
+        actor (request-actor req)
+        activity (terminal-activity target :docker/terminal-open)]
+    (if-not (core/csrf-validate csrf-token)
+      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
+      (try
+        (let [webshell (docker/open-webshell! target actor)
+              credentials (docker/reveal-webshell-credentials target actor)]
+          (broadcast-mutation! req
+                               {:event "refresh" :panels ["admin-containers-tbody" "docker-tbody"]}
+                               activity)
+          (core/htmx-response (views/render-terminal-panel
+                               (merge webshell credentials))
+                              ((:terminal-opened (:toast i18n/strings)) (:name webshell))
+                              "success"))
+        (catch Exception e
+          (record-failure! req activity e)
+          (core/htmx-error-response
+           (views/render-terminal-panel {:name target :error (:message (core/error-info e))})
+           e))))))
+
+(defn- handle-admin-terminal-credentials [req]
+  (let [params (core/parse-form-body req)
+        csrf-token (core/get-csrf-token req params)
+        target (:target params)
+        actor (request-actor req)]
+    (if-not (core/csrf-validate csrf-token)
+      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
+      (try
+        (let [webshell (docker/webshell-for target)]
+          (when-not webshell
+            (throw (ex-info (:terminal-session-not-found (:validation i18n/strings))
+                            {:type ::terminal-session-not-found :target target})))
+          (html-fragment-response
+           (views/render-terminal-panel
+            (merge webshell (docker/reveal-webshell-credentials target actor)))))
+        (catch Exception e
+          (core/htmx-error-response
+           (views/render-terminal-panel {:name target :error (:message (core/error-info e))})
+           e))))))
+
+(defn- handle-admin-terminal-close [req]
+  (let [params (core/parse-form-body req)
+        csrf-token (core/get-csrf-token req params)
+        target (:target params)
+        actor (request-actor req)
+        activity (terminal-activity target :docker/terminal-close)]
+    (if-not (core/csrf-validate csrf-token)
+      {:status 403 :body (:csrf-failed (:toast i18n/strings))}
+      (try
+        (docker/close-webshell! target actor)
+        (broadcast-mutation! req
+                             {:event "refresh" :panels ["admin-containers-tbody" "docker-tbody"]}
+                             activity)
+        (core/htmx-response (views/render-admin-containers-tbody csrf-token)
+                            ((:terminal-closed (:toast i18n/strings)) target)
+                            "success")
+        (catch Exception e
+          (record-failure! req activity e)
+          (core/htmx-error-response (views/render-admin-containers-tbody csrf-token) e))))))
+
+;; ============================================================
 ;; Main Router Dispatcher
 ;; ============================================================
 
@@ -948,11 +1036,11 @@
       ((core/wrap-auth handle-docker-stats) req)
 
       ;; Container Log Streaming (ttyd)
-      (and (= request-method :post) (= uri "/docker/logs/start"))
-      ((core/wrap-auth handle-docker-logs-start) req)
+      (and (= request-method :get) (= uri "/docker/logs"))
+      ((core/wrap-auth handle-docker-logs) req)
 
-      (and (= request-method :post) (= uri "/docker/logs/stop"))
-      ((core/wrap-auth handle-docker-logs-stop) req)
+      (and (= request-method :get) (= uri "/docker/logs/content"))
+      ((core/wrap-auth handle-docker-logs-content) req)
 
       ;; SmolVM Panel
       (and (= request-method :get) (= uri "/panel/smolvm"))
@@ -1012,6 +1100,16 @@
 
       (and (= request-method :post) (= uri "/admin/containers/assign"))
       ((core/wrap-auth (admin-only handle-admin-assign-container)) req)
+
+      ;; 管理员容器终端（持久 webshell）
+      (and (= request-method :post) (= uri "/admin/containers/terminal/open"))
+      ((core/wrap-auth (admin-only handle-admin-terminal-open)) req)
+
+      (and (= request-method :post) (= uri "/admin/containers/terminal/close"))
+      ((core/wrap-auth (admin-only handle-admin-terminal-close)) req)
+
+      (and (= request-method :post) (= uri "/admin/containers/terminal/credentials"))
+      ((core/wrap-auth (admin-only handle-admin-terminal-credentials)) req)
 
       ;; Health checks (no auth required)
       (and (= request-method :get) (contains? #{"/health" "/health/live"} uri))

@@ -39,3 +39,17 @@
                     {:type ::forbidden
                      :username (:username actor)})))
   actor)
+
+(defn require-admin!
+  "要求 actor 是管理员，否则抛 ::admin-required。
+
+   管理员专属能力没有资源所有者可以做后备校验（任意目标代理、宿主机容器会话等），
+   必须在领域入口校验，Handler 的角色判断只是第二道。"
+  ([actor] (require-admin! actor "仅管理员可执行此操作"))
+  ([actor permission-message]
+   (let [{:keys [username admin?]} (require-actor! actor)]
+     (when-not admin?
+       (throw (ex-info permission-message
+                       {:type ::admin-required
+                        :username username})))
+     actor)))
