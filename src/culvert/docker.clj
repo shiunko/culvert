@@ -934,6 +934,40 @@
 
       (to-public-container (get-in @state [:containers c-id])))))
 
+(defn auto-register-for-terminal!
+  "管理员开启 webshell 时，将未登记宿主机容器自动添加为最小应用记录。
+   已登记则跳过；不启动 ttyd、不做配额检查。"
+  [container-name actor]
+  (require-mutations-enabled!)
+  (authorization/require-admin! actor (:no-permission-container (:validation i18n/strings)))
+  (when-not (find-managed-container container-name)
+    (let [info (cli/inspect-container-details container-name)
+          image (:image info)
+          shell (adopt-container-shell image)
+          shell-port (allocate-port)
+          creds (generate-credentials)
+          shell-token (generate-token)
+          c-id (str (gensym "adopted-"))
+          container {:id c-id
+                     :name (:name info)
+                     :image image
+                     :userId (:username actor)
+                     :shellToken shell-token
+                     :shellUser (:shellUser creds)
+                     :shellPass (:shellPass creds)
+                     :shellPort shell-port
+                     :shell shell
+                     :ttydPid nil
+                     :caddyRuleId nil
+                     :createdAt (.toString (java.time.Instant/now))
+                     :status (if (= (:state info) "running") "running" "stopped")
+                     :cpuLimit "0"
+                     :memLimit "0"
+                     :gpu false
+                     :ports {}}]
+      (swap! state assoc-in [:containers c-id] container)
+      (save-entries!))))
+
 (defn start-container!
   "启动已授权且已停止的容器，并恢复 ttyd 与 Caddy 规则。"
   ([id actor]

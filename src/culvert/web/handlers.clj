@@ -801,6 +801,7 @@
     (if-not (core/csrf-validate csrf-token)
       {:status 403 :body (:csrf-failed (:toast i18n/strings))}
       (try
+        (docker/auto-register-for-terminal! target actor)
         (let [webshell (docker/open-webshell! target actor)
               credentials (docker/reveal-webshell-credentials target actor)]
           (broadcast-mutation! req

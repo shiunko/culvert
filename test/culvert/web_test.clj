@@ -642,6 +642,7 @@
     (let [broadcasts (atom [])
           recorded (atom [])]
       (with-redefs [auth/authenticate (fn [_ _] (admin-user))
+                    docker/auto-register-for-terminal! (fn [_ _] nil)
                     docker/open-webshell! (fn [target actor]
                                             (is (= "host-box" target))
                                             (is (true? (:admin? actor)))
