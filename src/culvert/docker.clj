@@ -215,11 +215,22 @@
   (when-not (:ttyd-enabled config false)
     (throw (ex-info "ttyd 功能未启用" {:type ::ttyd-disabled}))))
 
+(defn- ttyd-public?
+  "IP 模式且未显式关闭 ttydSessionPublic 时，ttyd 直接对外曝光。"
+  []
+  (boolean (and (:ip-mode config) (:ttyd-session-public config false))))
+
+(defn- ttyd-bind-address
+  "所有者 shell 与管理员终端共用的 ttyd 监听地址：
+   IP 模式曝光时绑定 :listen-address，否则只绑 loopback（域名模式由 Caddy 反代）。"
+  []
+  (if (ttyd-public?) (:listen-address config) "127.0.0.1"))
+
 (defn start-ttyd! [container]
   (require-ttyd-enabled!)
   (let [id (:id container)
         max-clients (:ttyd-max-clients config 1)
-        base-args ["-i" "127.0.0.1"
+        base-args ["-i" (ttyd-bind-address)
                    "-p" (str (:shellPort container))
                    "-c" (str (:shellUser container) ":" (:shellPass container))
                    "-W"]
@@ -318,9 +329,6 @@
   (when (and (:ip-mode config) (not (:ttyd-session-public config false)))
     (throw (ex-info (:terminal-exposure-disabled (:validation i18n/strings))
                     {:type ::terminal-exposure-disabled}))))
-
-(defn- webshell-bind-address []
-  (if (:ip-mode config) (:listen-address config) "127.0.0.1"))
 
 (defn- webshell-url [ws]
   (if (:ip-mode config)
@@ -427,7 +435,7 @@
   [name]
   (let [ws (get-in @state [:webshells name])
         args (vec (concat [(:ttyd-path config)
-                           "-i" (webshell-bind-address)
+                           "-i" (ttyd-bind-address)
                            "-p" (str (:port ws))
                            "-c" (str (:user ws) ":" (:pass ws))
                            "-W"
@@ -591,18 +599,21 @@
   (count (filter #(= (:userId %) user-id) (vals (:containers @state)))))
 
 (defn- to-public-container [c]
-  (let [shell-url (if (:ip-mode config)
-                    ;; IP mode: direct ttyd access via PUBLIC_IP:SHELL_PORT
-                    (when (:shellPort c)
+  ;; 只有所有者 ttyd 真正存活时才给出 Shell 链接：管理员开终端时自动登记的容器
+  ;; 只占了 :shellPort 而没有启动所有者 ttyd，不能把这个端口当成可访问入口。
+  (let [shell-url (cond
+                    (not (ttyd-alive? c)) nil
+                    ;; IP 模式：经 PUBLIC_IP:SHELL_PORT 直连 ttyd，曝光关闭时 ttyd 只绑 loopback
+                    (:ip-mode config)
+                    (when (and (:shellPort c) (ttyd-public?))
                       (format "http://%s:%d"
                               (:public-ip config)
                               (:shellPort c)))
-                    ;; Domain mode: Caddy subdomain URL
-                    (when (:caddyRuleId c)
-                      (let [parsed (caddy/parse-key (:caddyRuleId c))]
-                        (when parsed
-                          (format "https://%s.%s"
-                                  (:worker parsed) (:domain parsed))))))
+                    ;; 域名模式：Caddy 子域 URL
+                    (:caddyRuleId c)
+                    (when-let [parsed (caddy/parse-key (:caddyRuleId c))]
+                      (format "https://%s.%s"
+                              (:worker parsed) (:domain parsed))))
         ports-public (reduce (fn [acc [port info]]
                                (assoc acc port
                                       {:domain (:domain info "")

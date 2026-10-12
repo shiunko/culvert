@@ -306,6 +306,34 @@
             (is (= #{(get-in @docker/state [:webshells "live-box" :port])}
                    (:used-ports @docker/state)))))))))
 
+(deftest owner-shell-url-requires-live-owner-ttyd
+  (testing "管理员开终端时自动登记的容器：所有者 ttyd 未运行，不暴露 :shellPort 链接"
+    (let [argvs (atom [])]
+      (with-webshell-env
+        {:spawn (fn [a _] (swap! argvs conj a) (atom {:pid 4242 :proc :fake-proc}))}
+        (fn []
+          (let [admin {:username "root" :admin? true}]
+            (docker/auto-register-for-terminal! "host-box" admin)
+            (let [webshell (docker/open-webshell! "host-box" admin)
+                  owner (first (docker/get-containers "root" true))]
+              ;; 所有者 shell 先占用端口池首个端口，管理员终端拿到下一个
+              (is (= 17680 (:shellPort owner)))
+              (is (= "http://10.0.0.9:17681" (:url webshell)))
+              (is (nil? (:shellUrl owner))))
+
+            (testing "所有者 ttyd 启动后链接指向 :shellPort，且与管理员终端同样绑定 listen-address"
+              (let [record (val (first (:containers @docker/state)))]
+                (docker/start-ttyd! record)
+                (is (= "0.0.0.0" (second (drop-while #(not= "-i" %) (last @argvs)))))
+                (is (= "http://10.0.0.9:17680"
+                       (:shellUrl (first (docker/get-containers "root" true)))))))
+
+            (testing "IP 模式关闭 ttydSessionPublic：所有者 ttyd 只绑 loopback，不给出外部链接"
+              (with-redefs [config/config (assoc config/config :ttyd-session-public false)]
+                (docker/start-ttyd! (val (first (:containers @docker/state))))
+                (is (= "127.0.0.1" (second (drop-while #(not= "-i" %) (last @argvs)))))
+                (is (nil? (:shellUrl (first (docker/get-containers "root" true)))))))))))))
+
 ;; ============================================================
 ;; 容器状态结构测试
 ;; ============================================================
